@@ -2,6 +2,10 @@
 """
 fetch.py, Microsoft Graph fetcher for the ingest-outlook skill.
 
+Author:   Danny Bravo
+License:  MIT
+Project:  https://github.com/danilobrando/ingest-outlook
+
 Subcommands:
   mail      Outlook messages from a folder or free-text search query
   calendar  Calendar events from /me/calendarView
@@ -33,6 +37,10 @@ Stdlib only. No external dependencies.
 """
 from __future__ import annotations
 
+__author__ = "Danny Bravo"
+__version__ = "0.4.0"
+__license__ = "MIT"
+
 import argparse
 import base64
 import hashlib
@@ -51,13 +59,6 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-
-# ---------------------------------------------------------------------------
-# Version
-# ---------------------------------------------------------------------------
-
-__version__ = "0.4.0"
-
 
 # ---------------------------------------------------------------------------
 # Constants and config

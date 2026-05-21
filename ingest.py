@@ -2,6 +2,10 @@
 """
 ingest.py, Outlook/M365-to-vault normalizer for the ingest-outlook skill.
 
+Author:   Danny Bravo
+License:  MIT
+Project:  https://github.com/danilobrando/ingest-outlook
+
 Reads a JSON payload on stdin (one of three "kind"s):
   - kind=mail      → External Inputs/Outlook/Mail/<folder|query>/<date>.md
   - kind=calendar  → External Inputs/Outlook/Calendar/<date>.md
@@ -15,6 +19,9 @@ Each kind has its own normalizer and frontmatter shape. PII guardrails:
 Stdlib only. Self-contained (no _shared dependency).
 """
 from __future__ import annotations
+
+__author__ = "Danny Bravo"
+__license__ = "MIT"
 
 import argparse
 import hashlib

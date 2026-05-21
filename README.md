@@ -1,5 +1,7 @@
 # ingest-outlook
 
+> **Author:** Danny Bravo · **License:** MIT · **Repo:** [danilobrando/ingest-outlook](https://github.com/danilobrando/ingest-outlook)
+
 A Claude Code skill that connects Microsoft 365 (Outlook mail, calendar, Teams meetings) to a local Obsidian-style vault, with **autonomous self-healing**: when something breaks, the user just says "no funciona" and the system diagnoses and repairs itself.
 
 - **Reads**: Outlook mail, calendar events (own + shared), Teams meetings with transcripts
@@ -191,6 +193,10 @@ The architectural difference: most of those rely on an upstream MCP server. Micr
 
 Issues and pull requests welcome.
 
+## Author
+
+**Danny Bravo** — product strategist, AI ecosystem builder, educator. Builder of [Tribu iA](https://tribuia.org) and the Hardcore AI program.
+
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE). Copyright © 2026 Danny Bravo.
