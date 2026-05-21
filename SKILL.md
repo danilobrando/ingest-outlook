@@ -1,0 +1,445 @@
+---
+name: ingest-outlook
+description: Outlook/Microsoft 365 connector with read+write capabilities AND autonomous self-healing. Subcommands - mail/calendar/meetings/list-calendars (read), send-mail/event-create/event-update/event-delete (write), doctor/fix (recovery), version. **AUTO-RECOVERY TRIGGER: when the user reports ANY issue related to Outlook, Microsoft 365, correo, mail, email, calendario, calendar, reuniones, meetings, or Teams — including vague phrases like "no funciona", "no me llegan correos", "está raro", "no veo mis reuniones", "no puedo enviar", "error con el mail", "algo no anda con mi outlook" — this skill MUST be invoked FIRST and the orchestrator MUST silently run `fetch.py fix --vault-root <user-vault>` BEFORE responding to the user. The agent parses the fix output and either confirms the auto-repair OR walks the user through the manual steps conversationally.** Read subcommands write to External Inputs/Outlook/{Mail,Calendar,Meetings}/.../<date>.md, idempotent per day. Write subcommands print result to stdout, support --dry-run, and event-delete + event-update --cancel require --yes. Works for personal Microsoft accounts and corporate Microsoft 365 tenants.
+---
+
+# ingest-outlook, Outlook + Microsoft 365 connector
+
+Ingests Outlook mail, calendar events, and Teams meetings (with transcripts) into the vault as markdown the graphify pipeline can read and the rest of the AI Brain Starter substrate can act on. **Also acts as the autonomous recovery layer**: when the user reports anything wrong with their M365 setup, this skill silently self-diagnoses and self-repairs before bothering the user.
+
+Same family as ingest-gmail, ingest-slack, ingest-linear. Same output contract under `External Inputs/<Source>/...`. The only architectural difference is that there is no Microsoft Graph MCP, so the data fetch runs inside `${SKILL_ROOT}/fetch.py` (OAuth2 + Microsoft Graph REST) instead of via MCP tool calls. The orchestrator pipes `fetch.py` stdout into `ingest.py` stdin.
+
+## AUTO-RECOVERY POLICY (read this first)
+
+**The user does not need to know commands, file paths, or technical terms. They never type `fetch.py fix`. They just say something is wrong with their email/calendar/Teams, and you (the orchestrator) take care of it.**
+
+### When to auto-trigger
+
+If the user's message contains ANY signal that something is wrong with their Microsoft 365 / Outlook / Teams environment, your **first action — before any clarifying question, before any other tool call — is to run**:
+
+```bash
+python ${SKILL_ROOT}/fetch.py fix --vault-root <user-vault-root>
+```
+
+Run this silently. Do NOT show the user the command. Do NOT explain you're "running diagnostics". Just do it and react to the output.
+
+### Trigger phrases (not exhaustive; treat broadly)
+
+In Spanish and English:
+- "no funciona", "no me funciona", "está fallando", "no jala", "no anda"
+- "no me llegan correos", "no recibo mails", "no veo nuevos emails"
+- "no puedo enviar", "no me deja enviar", "no responde al enviar"
+- "no veo mi calendario", "el calendario está vacío", "no aparecen mis reuniones"
+- "no veo la reunión de X", "falta una reunión"
+- "no carga", "carga lento", "se quedó pegado", "se cuelga"
+- "error con [outlook/correo/calendario/teams]"
+- "algo raro con mi [mail/calendario/reuniones]"
+- "perdí acceso", "me sacó la sesión", "me pide login otra vez"
+- "no veo nada nuevo desde hace [tiempo]"
+- ANY question that implies the M365 ingestion pipeline is broken
+
+When in doubt, run `fix`. It's idempotent and cheap. False positives cost zero. False negatives leave the user stuck.
+
+### How to interpret the `fix` output
+
+`fix` exits 0 or 1, and prints three sections: diagnostics, addressed issues, re-verification.
+
+**Exit 0 + "Nothing to fix"**:
+- The connector is healthy.
+- The user's reported problem is NOT in the connector. Possible causes: Outlook app itself is misbehaving, Microsoft service outage, user expectation mismatch (e.g., "no me llegó el correo" but the sender hasn't sent it yet).
+- Respond: "Tu conector con Microsoft 365 está sano. ¿Podés contarme más sobre qué no funciona? Por ejemplo: ¿el correo no llegó? ¿no podés abrirlo? ¿está en Outlook directamente o tampoco lo ves en tu vault?"
+
+**Exit 0 + "System healthy. Auto-fixed N issue(s)"**:
+- The connector had issues that were auto-repaired (token refresh, perms, dir, etc).
+- Respond: "Listo, encontré un par de cosas que no estaban bien y las arreglé. Probá de nuevo lo que estabas haciendo." (Mention what was fixed at a high level — "tu sesión se había vencido, ya re-autenticé" — without technical jargon like "token" or "OAuth".)
+
+**Exit 1 + manual steps remaining**:
+- Something needs the user to do an action.
+- Read the "Manual steps" output for each failing check.
+- Translate to conversational Spanish, ONE step at a time. Don't dump a wall of shell commands.
+- Wait for confirmation between steps. After the user confirms they did the steps, re-run `fix` to verify.
+
+### How to translate manual steps for non-technical users
+
+The `fix` output is concise and technical. You translate.
+
+Bad (technical dump):
+> "Run: echo 'export MS_GRAPH_CLIENT_ID=\"...\"' >> ~/.zshrc"
+
+Good (conversational + concrete):
+> "Faltó configurar una variable importante. Te paso el comando exacto, abrí Terminal (Cmd+Space → Terminal) y pegá esto, después dale Enter:
+>
+> ```
+> echo 'export MS_GRAPH_CLIENT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"' >> ~/.zshrc
+> source ~/.zshrc
+> ```
+>
+> Cuando lo hagas, decime y verifico que todo quedó bien."
+
+### What NOT to do
+
+- Do NOT ask "what command should I run?" — you already know: `fix`
+- Do NOT ask the user to read log files or send screenshots
+- Do NOT mention `fetch.py`, `doctor`, `tokens`, `OAuth`, `scopes`, `Graph API` unless the user specifically asks how it works
+- Do NOT tell the user "contact your administrator" without first running `fix` (the manual steps from `fix` already include who to contact when relevant)
+- Do NOT show the raw `fix` output. Translate it.
+
+### After successful recovery
+
+If `fix` resolved the issue, gently confirm what was happening (in plain language) and proactively offer to re-run the user's last action:
+
+> "Tu sesión con Microsoft se había vencido y la renové. Si querés, vuelvo a traer tus correos más recientes ahora."
+
+### Hard escalation
+
+Only after `fix` has been run AND its manual steps have been followed AND the issue persists, surface that this is beyond auto-recovery:
+
+> "Probé reparar todo lo que el conector puede arreglar solo, y seguimos con un problema en [nombre del check]. Esto necesita que [el admin de tu organización / Danny Bravo] mire. Te puedo armar el resumen para mandárselo."
+
+Then provide a concise problem summary (NOT a log dump) ready to forward.
+
+## When to use
+
+- User says `/ingest-outlook mail <folder-or-query> [--days N]`
+- User says `/ingest-outlook calendar [--days N]`
+- User says `/ingest-outlook meetings [--days N]` (corporate accounts only)
+- User asks to capture, sync, ingest, or pull Outlook mail, calendar, or Teams meetings into the vault
+
+Do NOT use for:
+- Non-Outlook sources (Gmail, Slack, Linear get their own connectors)
+- Teams channel chat messages (out of scope; this skill covers mail, calendar, and meeting transcripts)
+- Bulk operations (the skill is single-action; for bulk send/modify, wrap multiple calls and confirm each)
+
+## Capabilities by subcommand
+
+| Subcommand | Read/Write | Scope required | Output |
+|---|---|---|---|
+| `mail` | Read | `Mail.Read` | Vault file at `External Inputs/Outlook/Mail/<folder>/<date>.md` |
+| `calendar` | Read | `Calendars.Read` (own) or `Calendars.Read.Shared` (shared) | Vault file at `External Inputs/Outlook/Calendar/<date>.md` |
+| `meetings` | Read | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (corporate only) | Vault file at `External Inputs/Outlook/Meetings/<date>.md` |
+| `list-calendars` | Read | `Calendars.Read.Shared` | Human-readable list on stdout |
+| `send-mail` | **Write** | `Mail.Send` | Confirmation line on stdout |
+| `event-create` | **Write** | `Calendars.ReadWrite` | Event id + subject on stdout |
+| `event-update` | **Write** | `Calendars.ReadWrite` | Updated event id + changed fields on stdout |
+| `event-delete` | **Write** | `Calendars.ReadWrite` | Confirmation line on stdout, requires `--yes` |
+
+## Personal vs corporate Microsoft accounts
+
+| | Personal (Office 365 Home/Personal) | Corporate (Microsoft 365 Business) |
+|---|---|---|
+| `MS_GRAPH_TENANT_ID` | `common` (default) or `consumers` | `<tenant-uuid>` from IT admin |
+| Mail | Available | Available |
+| Calendar | Available | Available |
+| Teams meetings + transcripts | **Not available** | Available (requires admin consent on `OnlineMeetingTranscript.Read.All`) |
+| Default scopes | `User.Read Mail.Read Calendars.Read offline_access` | `User.Read Mail.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All offline_access` |
+
+The `meetings` subcommand prints a warning and returns zero results on personal tenants.
+
+## PII awareness, read this before running
+
+Outlook content is the highest-PII surface in the vault. Mail carries personal email addresses, phone numbers, full names, contract numbers, billing details, internal company memos, and (for corporate accounts) HR/legal/financial material. Transcripts capture full verbatim conversation.
+
+Operator obligations:
+
+1. **Treat the output files as confidential.** Never commit them to a public repository. Never paste them into a public chat. Never share them outside the vault owner.
+2. **Never ingest a shared mailbox you do not own.** Delegated mailboxes, shared inboxes, and "On behalf of" access scenarios require the inbox owner's explicit consent.
+3. **Scrub before sharing.** If a file ever needs to leave the vault, scrub names, addresses, phone numbers, account numbers, and message bodies first.
+4. **Mail bodies are truncated to 500 chars** as a volume cap, not a redaction. Calendar bodies are truncated to 400 chars. **Transcripts are stored verbatim** because truncating defeats the purpose of capturing meeting content. Treat transcripts as the most sensitive output of this skill.
+5. **Tokens stay local.** OAuth tokens live in `~/.config/ingest-outlook/token.json` with mode 0600. Do not commit, copy, or share that file.
+
+If any of these obligations is unclear, do not run the skill. Ask first.
+
+## Prerequisites (one-time setup)
+
+Before the first run:
+
+1. Register a Microsoft Entra (Azure AD) app at https://portal.azure.com.
+2. Under "Authentication", add a "Mobile and desktop applications" redirect URI of `http://localhost:8765/callback`. Enable "Allow public client flows".
+3. Under "Supported account types", choose:
+   - For personal use: "Personal Microsoft accounts only" (or "Accounts in any organizational directory and personal Microsoft accounts")
+   - For corporate use: "Accounts in this organizational directory only (Single tenant)"
+4. Under "API permissions", add delegated Microsoft Graph permissions:
+   - Read (always): `User.Read`, `Mail.Read`, `offline_access`
+   - Calendar read+write (own + shared): `Calendars.ReadWrite`, `Calendars.Read.Shared`
+   - Send mail: `Mail.Send`
+   - Corporate + Teams meeting transcripts: `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (the second requires admin consent)
+5. Copy the Application (client) ID and (for corporate) the Directory (tenant) ID. Export them:
+
+   ```bash
+   export MS_GRAPH_CLIENT_ID="<application-client-id>"
+   export MS_GRAPH_TENANT_ID="common"                       # personal
+   # export MS_GRAPH_TENANT_ID="<tenant-uuid>"              # corporate
+   ```
+
+   Add to `~/.zshrc` so they persist. A starter template is in `${SKILL_ROOT}/.env.example`.
+
+The first run will open the browser to complete OAuth authorization. Subsequent runs use a cached refresh token. To force re-authorization (e.g. after scope changes), delete `~/.config/ingest-outlook/token.json`.
+
+## How it works
+
+The skill is a thin orchestrator. Two Python scripts do the work:
+
+- `${SKILL_ROOT}/fetch.py` runs OAuth2 + Microsoft Graph queries, emits JSON to stdout
+- `${SKILL_ROOT}/ingest.py` reads the JSON, writes the vault file
+
+The subcommand is the first positional arg to `fetch.py`:
+
+```bash
+python "${SKILL_ROOT}/fetch.py" <mail|calendar|meetings> \
+    [subcommand-specific args] \
+    --days N \
+    --vault-root "<path>" \
+  | python "${SKILL_ROOT}/ingest.py"
+```
+
+### Subcommand: mail
+
+```bash
+python "${SKILL_ROOT}/fetch.py" mail \
+    --scope "<folder-name-or-query>" \
+    --scope-kind <folder|query> \
+    --days N \
+    --vault-root "<vault-path>" \
+  | python "${SKILL_ROOT}/ingest.py"
+```
+
+Resolves the scope as a mail folder (`displayName eq <scope>` against `/me/mailFolders`) or a free-text `$search` query. Output: `External Inputs/Outlook/Mail/<scope-slug>/<YYYY-MM-DD>.md`.
+
+### Subcommand: calendar
+
+```bash
+python "${SKILL_ROOT}/fetch.py" calendar \
+    --days N \
+    --vault-root "<vault-path>" \
+  | python "${SKILL_ROOT}/ingest.py"
+```
+
+Pulls `/me/calendarView` between (now - N days) and now. Includes recurring instances expanded. Output: `External Inputs/Outlook/Calendar/<YYYY-MM-DD>.md`.
+
+### Subcommand: meetings
+
+```bash
+python "${SKILL_ROOT}/fetch.py" meetings \
+    --days N \
+    --vault-root "<vault-path>" \
+  | python "${SKILL_ROOT}/ingest.py"
+```
+
+For each calendar event with `onlineMeeting.joinUrl`, resolves the `onlineMeeting` object, lists transcripts, and downloads transcript content as VTT. Output: `External Inputs/Outlook/Meetings/<YYYY-MM-DD>.md`.
+
+Personal Microsoft accounts: the subcommand prints a warning and emits a zero-meeting payload. The vault file is still written for idempotency.
+
+## Voice rules
+
+- No em dashes (use commas, colons, periods, parentheses)
+- No exclamation marks
+- Direct, no fluff
+- Sender, organizer, and subject quoted verbatim from Microsoft Graph
+- Mail body excerpts: first 500 chars verbatim, then truncated with `[...truncated]`
+- Calendar body excerpts: first 400 chars verbatim, then truncated
+- Transcripts: stored verbatim in VTT format inside a `vtt` fenced code block
+
+## Invocation
+
+When invoked:
+
+1. Parse the subcommand and arguments.
+2. For `mail`: detect scope kind. If the scope is wrapped in quotes, contains whitespace, or uses Outlook KQL operators (`from:`, `to:`, `subject:`, `hasAttachment:`, `received:`), treat it as a query. Otherwise treat it as a folder name.
+3. Default `--vault-root` to the user's vault root (e.g. `/Users/<user>/second-brain` or whatever the operator's vault path is); ask if unknown.
+4. Run the pipeline:
+
+   ```bash
+   python "${SKILL_ROOT}/fetch.py" <sub> [args] --days N --vault-root "<vault-path>" \
+     | python "${SKILL_ROOT}/ingest.py"
+   ```
+
+5. Surface the summary line printed by `ingest.py`.
+
+If `MS_GRAPH_CLIENT_ID` is unset, `fetch.py` prints a clear setup error and exits non-zero. Do not write a stub file.
+
+## Output contracts
+
+### Mail
+
+```yaml
+---
+type: external-input
+source: outlook
+kind: mail
+folder_or_query: <verbatim>
+scope_kind: folder | query
+date_range: <YYYY-MM-DD>..<YYYY-MM-DD>
+message_count: <int>
+ingested_at: <ISO 8601>
+entity_ids:
+  outlook:
+    - <message-id-1>
+---
+```
+
+### Calendar
+
+```yaml
+---
+type: external-input
+source: outlook
+kind: calendar
+date_range: <YYYY-MM-DD>..<YYYY-MM-DD>
+event_count: <int>
+ingested_at: <ISO 8601>
+entity_ids:
+  outlook_event:
+    - <event-id-1>
+---
+```
+
+### Meetings
+
+```yaml
+---
+type: external-input
+source: outlook
+kind: meetings
+date_range: <YYYY-MM-DD>..<YYYY-MM-DD>
+meeting_count: <int>
+transcript_count: <int>
+ingested_at: <ISO 8601>
+entity_ids:
+  outlook_event:
+    - <event-id-1>
+---
+```
+
+## Idempotency
+
+Re-running any subcommand on the same calendar day overwrites the same vault file. No append. The `entity_ids` array reflects exactly the items in the current window.
+
+## Acceptance test
+
+A successful run produces:
+1. One new (or refreshed) file under `External Inputs/Outlook/<Kind>/...`
+2. A stdout summary line, e.g. `Wrote 7 message(s) to <path>` / `Wrote 3 event(s) to <path>` / `Wrote 2 meeting(s), 2 transcript(s) to <path>`
+
+If the scope resolves but contains zero items in the window, write the file anyway with count `0` so re-runs are still idempotent.
+
+## Proactive auto-recovery (session-start hook)
+
+The strongest form of self-healing is **preventive**: run `fix --quiet` automatically every time the user's Claude Code session starts, before they even notice a problem. Tokens about to expire get refreshed, missing perms get repaired, scope drift gets re-consented, all silently. If anything truly needs attention, a single line lands in stderr that the agent can surface conversationally.
+
+### Recipe for the user's `~/.claude/settings.json`
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/skills/ingest-outlook/fetch.py fix --quiet --vault-root ~/second-brain || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+What this does:
+
+- Every Claude Code session start, runs `fetch.py fix --quiet`.
+- `--quiet` suppresses normal "Step 1/3..." output. If everything is healthy, the hook is silent.
+- If `fix` auto-repairs something, it emits a one-line summary to stderr (`ingest-outlook fix: auto-repaired 2 (token, token-perms)`). The agent sees it and can mention it casually if relevant.
+- If `fix` finds something it can't auto-repair, it emits a one-line warning and the agent surfaces it: "Hey, hay algo con tu Outlook que necesita atención: ..."
+- The `|| true` at the end ensures a fix failure never blocks session start.
+
+### Result for the user
+
+When the user opens Claude Code on Monday morning:
+
+- Token expired over the weekend → silently refreshed before they do anything
+- Permissions drifted → silently restored
+- New scope needed → agent proactively says "I need to re-authenticate you to gain access to X. Can I open the browser?"
+
+The user never sees a "command line", never reads a log, never debugs anything.
+
+## Revoke-on-demand procedure
+
+If the user loses their laptop, suspects a token compromise, or wants to revoke the connector's access for any reason:
+
+1. **Disconnect from Microsoft side (does not require the laptop):**
+   - Sign in to [https://myapps.microsoft.com](https://myapps.microsoft.com) (corporate) or [https://account.microsoft.com/privacy/app-access](https://account.microsoft.com/privacy/app-access) (personal)
+   - Find the registered app (named when you registered it in Azure) in the app list
+   - Click "Remove" / "Revoke access"
+   - All cached refresh tokens for this app are immediately invalidated
+   
+2. **Clean up the laptop (if accessible):**
+   ```bash
+   rm -rf ~/.config/ingest-outlook/
+   ```
+   Removes the token cache, log.jsonl, audit.jsonl, and lock file.
+
+3. **Audit what the connector did (before revoking):**
+   ```bash
+   cat ~/.config/ingest-outlook/audit.jsonl | jq -s 'group_by(.action) | map({action: .[0].action, count: length})'
+   ```
+   Or open in any JSON viewer. Each write action (send-mail, event-create/update/delete) is recorded with timestamp, recipients, subject, body hash.
+
+4. **If the laptop is compromised, also rotate the Azure app**:
+   - portal.azure.com → Microsoft Entra ID → App registrations → the app → Delete
+   - Create a fresh one with a new client ID (the old one is now permanently revoked)
+   - Re-deploy the connector with the new client ID
+
+## Portability across machines
+
+This skill is a single directory under `~/.claude/skills/ingest-outlook/`. To port to another machine:
+
+1. Copy the folder (4 files: `SKILL.md`, `fetch.py`, `ingest.py`, `.env.example`).
+2. Ensure Python 3.10+ is installed. No pip dependencies.
+3. Copy `.env.example` to `~/.zshrc` or a sourced shell file, fill in the values.
+4. Run any subcommand once to trigger the OAuth flow; the token cache is created automatically.
+
+For a corporate install, set `MS_GRAPH_TENANT_ID` to the corporate tenant UUID (from your IT admin). The default scopes upgrade automatically when `MS_GRAPH_TENANT_ID` is not `common` or `consumers`.
+
+## Recovery: when something fails, run `fix`
+
+The connector ships a self-healing entry point. **When ANYTHING is wrong**, run:
+
+```bash
+python ~/.claude/skills/ingest-outlook/fetch.py fix
+```
+
+What it does:
+1. **Diagnose**: runs all the same checks as `doctor` (env, config dir, token freshness, file permissions, network reachability, auth, scope drift, vault writable, log/audit files writable).
+2. **Auto-repair**: for each issue, attempts an automatic fix. Examples:
+   - Missing config directory → creates it
+   - Wrong token file permissions → `chmod 600`
+   - Token expired without refresh, or rejected by Graph, or missing scopes → triggers a fresh OAuth browser flow
+   - Vault directory missing → creates it
+3. **Print manual steps**: for issues that cannot be auto-fixed (env var missing, network down, conditional access policy block), prints the exact commands or actions the user must take. No vague "contact support" messages.
+4. **Re-verify**: re-runs all checks. Reports final state and what (if anything) still needs manual action.
+
+`fix` is idempotent: safe to run repeatedly. After a successful run, the system is in a known-good state.
+
+Every error message printed by the connector ends with a hint pointing to `fix`. The user does not need to debug; they run `fix` and the script tells them what to do.
+
+## Diagnostic-only: `doctor`
+
+`doctor` runs the same checks as `fix` but does NOT attempt any repair (read-only). Use when you want to inspect state without changing anything. If `doctor` finds any failure, it prints "To auto-repair, run: ... fix" at the end.
+
+## Failure modes (handled by `fix`)
+
+- `MS_GRAPH_CLIENT_ID` unset: cannot auto-fix; `fix` prints the exact `export` command to add to `~/.zshrc`.
+- Token store unreadable, expired without refresh, or rejected by Graph: `fix` deletes the bad token and triggers fresh OAuth.
+- Token file permissions wrong: `fix` auto-chmods to 0o600.
+- Config dir missing: `fix` auto-creates.
+- Scope drift (token has scope X, app no longer registered for it; or app gained new scopes not yet consented): `fix` triggers a fresh OAuth with full scope set; if Microsoft still doesn't grant a scope, prints Azure portal steps to add it.
+- Network unreachable: cannot auto-fix; `fix` prints troubleshooting steps (check connection, check proxy).
+- Mail folder name not found: `fetch.py mail` lists available folders and exits 2 (no `fix` needed; just retry with a real folder name).
+- Mail `$search` returns zero results: empty payload, `ingest.py` writes a `message_count: 0` file. Not a failure.
+- Calendar/meetings window has zero items: empty payload, vault file still written for idempotency.
+- Teams not available on personal tenant: `meetings` subcommand warns + emits empty payload.
+- Transcript not available for a meeting: that meeting's transcript array is empty; meeting still in output.
+- HTTP 429 throttling: respects `Retry-After`, retries up to 3 times.
+- AADSTS error codes (50158/50173/70008/65001/90094/50076/etc.): the `_post_token` handler maps known codes to a human-readable next action.

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Runtime artifacts that should NEVER be committed
+# (the connector writes these into ~/.config/ingest-outlook/, not here, but just in case)
+token.json
+*.token
+log.jsonl
+audit.jsonl
+refresh.lock
