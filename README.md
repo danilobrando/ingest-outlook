@@ -13,15 +13,27 @@ A Claude Code skill that connects Microsoft 365 (Outlook mail, calendar, Teams m
 
 ## Quick start
 
+This connector follows the **second-brain connector standard**: all connectors live under `~/second-brain/connectors/` and Claude Code discovers them through a symlink at `~/.claude/skills/`. Three commands:
+
 ```bash
+mkdir -p ~/second-brain/connectors
+cd ~/second-brain/connectors
 git clone https://github.com/danilobrando/ingest-outlook.git
 cd ingest-outlook
 ./install.sh
 ```
 
-The installer copies the skill files to `~/.claude/skills/ingest-outlook/`, verifies your Python version, and prints the remaining configuration steps.
+The installer:
+1. Verifies it is running from the canonical location (`~/second-brain/connectors/ingest-outlook/`)
+2. Verifies Python 3.10+ is present
+3. Creates the symlink `~/.claude/skills/ingest-outlook` → the cloned repo (Claude Code discovers it through this path)
+4. Creates `~/.config/ingest-outlook/` at mode 0700 for the token cache
+5. Smoke-tests `fetch.py`
+6. Prints the remaining configuration steps
 
-After that:
+> The repo lives in your vault (under `~/second-brain/connectors/`) so it travels with your vault backups. Tokens and logs live in `~/.config/ingest-outlook/` and stay machine-local.
+
+After install:
 
 1. **Register an Azure app** (one-time, 5 minutes). See [`docs/azure-app-setup.md`](docs/azure-app-setup.md).
 2. **Export two env vars** in your shell:
