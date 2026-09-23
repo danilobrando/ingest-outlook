@@ -16,7 +16,7 @@ Desactiva los alias de la Microsoft Store para Python: **Configuración > Aplica
 Abre PowerShell. Reemplaza `<cargo>`, `<client-id>` y `<tenant-id>`, y ejecuta estos tres comandos:
 
 ```powershell
-git clone --branch v0.5.0 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
+git clone --branch v0.5.1 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
 py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py" fix
 ```

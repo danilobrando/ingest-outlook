@@ -410,6 +410,40 @@ class IngestOutlookV050Tests(unittest.TestCase):
             self.assertNotIn("Missing scopes", result.stdout)
             self.assertIn("[PASS] scopes", result.stdout)
 
+    def test_doctor_personal_account_missing_shared_calendars_is_warning_not_reauth(self):
+        # Real case (2026-09-23): a personal Microsoft account signed in with the
+        # default personal scope set; Microsoft did not grant Calendars.Read.Shared.
+        with tempfile.TemporaryDirectory() as tmp, fake_server() as server:
+            root = Path(tmp)
+            config_dir, vault = root / "config", root / "vault"
+            vault.mkdir()
+            write_config(config_dir, vault, tenant_id="common", read_only=False)
+            write_token(config_dir)
+            token_path = config_dir / "token.json"
+            token = json.loads(token_path.read_text(encoding="utf-8"))
+            token["scopes_granted"] = ["User.Read", "Mail.Read", "Mail.Send", "Calendars.ReadWrite", "openid", "profile"]
+            token_path.write_text(json.dumps(token), encoding="utf-8")
+            result = run_fetch(clean_env(config_dir, server), "doctor")
+            self.assertIn("[WARN] scopes", result.stdout)
+            self.assertIn("Calendars.Read.Shared", result.stdout)
+            self.assertNotIn("[FAIL] scopes", result.stdout)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_doctor_missing_core_scope_still_fails(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_server() as server:
+            root = Path(tmp)
+            config_dir, vault = root / "config", root / "vault"
+            vault.mkdir()
+            write_config(config_dir, vault)
+            write_token(config_dir)
+            token_path = config_dir / "token.json"
+            token = json.loads(token_path.read_text(encoding="utf-8"))
+            token["scopes_granted"] = ["User.Read", "Calendars.Read"]
+            token_path.write_text(json.dumps(token), encoding="utf-8")
+            result = run_fetch(clean_env(config_dir, server), "doctor")
+            self.assertIn("[FAIL] scopes", result.stdout)
+            self.assertIn("Mail.Read", result.stdout)
+
     def test_configure_writes_file_and_precedence_is_arg_env_file_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

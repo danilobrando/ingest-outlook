@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- `doctor`/`fix`: optional scopes that Microsoft may legitimately not grant (`Calendars.Read.Shared`, `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All`) are now a WARN without auto-fix instead of a FAIL that re-opened the browser on every `fix`. Found on the first real sign-in with a personal Microsoft account. Missing core scopes still FAIL.
+- First end-to-end run against a real account: sign-in, `calendar --days 1 --ahead 1` (UTC → local time correct) and `mail`.
+
 ## 0.5.0
 
 - Fixed UTC calendar timestamps without a `Z` suffix being rendered as local time.

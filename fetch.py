@@ -37,7 +37,7 @@ Stdlib only. No external dependencies.
 from __future__ import annotations
 
 __author__ = "Danny Bravo"
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __license__ = "MIT"
 
 import argparse
@@ -99,6 +99,15 @@ EXIT_READ_ONLY_BLOCKED = 3
 # Entra often omits these from the token `scope` even when consent succeeded.
 # Treating them as missing makes `doctor`/`fix` re-authenticate forever.
 PROTOCOL_SCOPES = frozenset({"offline_access", "openid", "profile", "email"})
+# Scopes that unlock extra features but that Microsoft may legitimately not grant:
+# personal accounts never get shared-calendar or Teams scopes, and corporate
+# tenants only grant Teams transcript scopes after admin consent. Re-auth cannot
+# fix either case, so doctor reports them as WARN without an auto-fix.
+OPTIONAL_SCOPES = frozenset({
+    "calendars.read.shared",
+    "onlinemeetings.read",
+    "onlinemeetingtranscript.read.all",
+})
 GRAPH_SCOPE_PREFIX = "https://graph.microsoft.com/"
 
 TOKEN_DIR = Path(
@@ -2346,7 +2355,15 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
             ))
         elif ok:
             results.append(CheckResult(PASS, "scopes", f"all {len(expected)} expected scopes granted"))
+        elif all(_normalize_scope(m).lower() in OPTIONAL_SCOPES for m in missing):
+            results.append(CheckResult(
+                WARN, "scopes",
+                f"Optional scopes not granted: {', '.join(missing)}. Core mail/calendar access works; "
+                "shared calendars and/or Teams meetings are unavailable for this account "
+                "(normal for personal Microsoft accounts; corporate tenants need admin consent).",
+            ))
         else:
+            missing = [m for m in missing if _normalize_scope(m).lower() not in OPTIONAL_SCOPES] or missing
             results.append(CheckResult(
                 FAIL, "scopes",
                 f"Missing scopes: {', '.join(missing)}.",
