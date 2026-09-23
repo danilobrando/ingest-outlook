@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import datetime, time as datetime_time, timedelta, timezone
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
@@ -141,6 +141,11 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 
+def _is_windows() -> bool:
+    """Single seam for platform checks (tests patch this, not os.name)."""
+    return os.name == "nt"
+
+
 def _configure_console_encoding() -> None:
     """Emit UTF-8 diagnostics even on legacy Windows code pages (cp1252)."""
     for stream in (sys.stdout, sys.stderr):
@@ -153,7 +158,7 @@ def _configure_console_encoding() -> None:
 
 
 def _chmod_private(path: Path, mode: int) -> None:
-    if os.name != "nt":
+    if not _is_windows():
         try:
             os.chmod(path, mode)
         except OSError:
@@ -440,7 +445,7 @@ def _parse_bool(value: Any, default: bool = False) -> bool:
 
 def validate_output_dir(value: str) -> str:
     value = str(value).strip().replace("\\", "/")
-    posix_path = Path(value)
+    posix_path = PurePosixPath(value)
     windows_path = PureWindowsPath(value)
     if not value or posix_path.is_absolute() or windows_path.is_absolute():
         raise ValueError("output_dir must be a non-empty path relative to the vault")
@@ -471,7 +476,7 @@ def _value_with_source(
 
 
 def _print_missing_client_id() -> None:
-    if os.name == "nt":
+    if _is_windows():
         setup = f"  {_command_hint('configure')} --client-id <guid> --tenant-id <guid>"
     else:
         setup = (
@@ -2148,7 +2153,7 @@ def _fix_create_config_dir() -> tuple[bool, str]:
 
 
 def _fix_chmod_token() -> tuple[bool, str]:
-    if os.name == "nt":
+    if _is_windows():
         return True, "Windows uses the user profile ACL; chmod is not applicable."
     try:
         os.chmod(TOKEN_PATH, 0o600)
@@ -2270,7 +2275,7 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
 
     # 4. TOKEN FILE PERMISSIONS
     if TOKEN_PATH.is_file():
-        if os.name == "nt":
+        if _is_windows():
             results.append(CheckResult(
                 PASS, "token-perms", "Windows: protegido por el ACL del perfil de usuario"
             ))

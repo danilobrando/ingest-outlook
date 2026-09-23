@@ -495,7 +495,7 @@ class IngestOutlookV050Tests(unittest.TestCase):
                 raise AssertionError(url)
 
             with mock.patch.dict(os.environ, env, clear=True), \
-                    mock.patch.object(module.os, "name", "nt"), \
+                    mock.patch.object(module, "_is_windows", return_value=True), \
                     mock.patch.object(module.urllib.request, "urlopen", side_effect=fake_urlopen):
                 results = module.run_checks()
             perms = next(item for item in results if item.name == "token-perms")
