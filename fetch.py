@@ -2707,6 +2707,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
             cfg = load_config(require_client=False)
         except ValueError as exc:
             print(f"ERROR [{label}]: configuración inválida: {exc}", file=sys.stderr)
+            _log_event("sync", "failure", error_code="invalid_config", extra={"detail": str(exc)[:300]})
+            raw = _read_profile_file(profile) if profile else _read_config_file()
+            raw_vault = args.vault_root or raw.get("vault_root")
+            if raw_vault and str(raw.get("layout") or "").lower() == "cerebro" and not dry_run:
+                line = sync_cerebro.RunResult(perfil=label, estado=f"error: configuración inválida ({exc})")
+                try:
+                    log_rel = validate_vault_relative(str(raw.get("ingest_log_path") or DEFAULT_INGEST_LOG),
+                                                      "ingest_log_path")
+                except ValueError:
+                    log_rel = DEFAULT_INGEST_LOG
+                _append_ingest_log(str(raw_vault), log_rel, line.log_line(_now_local_iso()))
             worst = max(worst, 2)
             continue
         vault = args.vault_root or cfg.vault_root
@@ -2905,7 +2916,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
         print(
             "La ingesta automática se programa en Windows (Programador de tareas) y en macOS "
             "(LaunchAgent); en este sistema no se programó nada. Puedes correr "
-            f"`{_command_hint('sync --all')}` desde cron o systemd por tu cuenta."
+            f"`\"{sys.executable}\" \"{Path(__file__).resolve()}\" sync --all` desde cron o systemd por tu cuenta."
         )
         return 0
 

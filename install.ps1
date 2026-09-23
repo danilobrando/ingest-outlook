@@ -108,7 +108,7 @@ Write-Host "================================"
 if ($Layout -eq "cerebro" -and [string]::IsNullOrWhiteSpace($Empresa)) {
     throw "-Layout cerebro requires -Empresa <slug> (the short company name written in every raw file)."
 }
-if (-not [string]::IsNullOrWhiteSpace($ProfileName) -and $ProfileName -notmatch '^[a-z0-9-]{1,32}$') {
+if (-not [string]::IsNullOrWhiteSpace($ProfileName) -and $ProfileName -cnotmatch '^[a-z0-9-]{1,32}$') {
     throw "-Profile must be a slug: lowercase letters, digits and dashes (max 32)."
 }
 

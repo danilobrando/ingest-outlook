@@ -886,6 +886,15 @@ class SyncTests(unittest.TestCase):
             doctor = run_fetch(env.env, "doctor", "--profile", "acme")
             self.assertIn("[FAIL] empresa", doctor.stdout)
 
+            # an invalid empresa (not a slug) is refused the same way, with a log line
+            config = json.loads((profile_dir / "config.json").read_text(encoding="utf-8"))
+            config["empresa"] = "Acme SAS"
+            (profile_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            invalid = env.sync("--all")
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("estado error: configuración inválida (empresa must be a slug", env.log_lines()[-1])
+            self.assertFalse((env.vault / DEFAULT_RAW).exists())
+
     def test_legacy_layout_refuses_sync_and_keeps_v05_behavior(self):
         with tempfile.TemporaryDirectory() as tmp, fake_server("basic") as server:
             env = SyncEnv(tmp, server, profiles=())
