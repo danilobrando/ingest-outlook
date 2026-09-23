@@ -54,7 +54,7 @@ def configure_console_encoding() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             try:
-                reconfigure(errors="replace")
+                reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass
 

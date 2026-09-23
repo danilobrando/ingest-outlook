@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -10,7 +11,7 @@ import threading
 import time
 import unittest
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -154,6 +155,9 @@ def clean_env(config_dir: Path, server: FakeGraphServer | None = None) -> dict[s
         "INGEST_OUTLOOK_REDIRECT_PORT", "INGEST_OUTLOOK_READ_ONLY",
         "INGEST_OUTLOOK_OUTPUT_DIR", "INGEST_OUTLOOK_VAULT_ROOT",
         "INGEST_OUTLOOK_GRAPH_BASE", "INGEST_OUTLOOK_AUTHORITY_BASE",
+        # The connector must configure its own console encoding; the tests
+        # must not force UTF-8 via the parent environment.
+        "PYTHONIOENCODING", "PYTHONUTF8",
     ):
         env.pop(key, None)
     env["INGEST_OUTLOOK_CONFIG_DIR"] = str(config_dir)
@@ -538,6 +542,92 @@ class IngestOutlookV050Tests(unittest.TestCase):
             self.assertEqual(len(server.token_requests), 1)
             message_calls = [path for method, path in server.paths if method == "GET" and path.startswith("/me/mailFolders/folder-1/messages")]
             self.assertEqual(len(message_calls), 2)
+
+
+    def test_verify_scopes_ignores_protocol_scopes_case_and_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            module = load_fetch_module(Path(tmp) / "config")
+            ok, missing = module.verify_scopes(
+                {"scopes_granted": ["offline_access", "openid", "profile", "email", "Mail.Read"]},
+                ["Mail.Read", "offline_access", "openid", "profile", "email"],
+            )
+            self.assertTrue(ok)
+            self.assertEqual(missing, [])
+            ok, _missing = module.verify_scopes(
+                {"scopes_granted": ["https://graph.microsoft.com/mail.read"]},
+                ["Mail.Read"],
+            )
+            self.assertTrue(ok)
+            ok, missing = module.verify_scopes(
+                {"scopes_granted": ["Mail.Read"]},
+                ["Mail.Read", "Calendars.Read"],
+            )
+            self.assertFalse(ok)
+            self.assertEqual(missing, ["Calendars.Read"])
+            ok, missing = module.verify_scopes({"access_token": "legacy"}, ["Mail.Read"])
+            self.assertTrue(ok)
+            self.assertEqual(missing, [])
+
+    def test_read_only_env_scopes_drop_write_scopes_with_stderr_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir, vault = root / "config", root / "vault"
+            write_config(config_dir, vault)
+            module = load_fetch_module(config_dir)
+            env = clean_env(config_dir)
+            env["MS_GRAPH_SCOPES"] = (
+                "User.Read Mail.Read Mail.Send Calendars.ReadWrite "
+                "OnlineMeetingTranscript.Read.All"
+            )
+            with mock.patch.dict(os.environ, env, clear=True):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    cfg = module.load_config(require_client=False)
+            self.assertEqual(
+                cfg.scopes,
+                ["User.Read", "Mail.Read", "OnlineMeetingTranscript.Read.All"],
+            )
+            self.assertIn("Mail.Send", stderr.getvalue())
+            self.assertIn("Calendars.ReadWrite", stderr.getvalue())
+
+    def test_read_only_meetings_blocked_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir, vault = root / "config", root / "vault"
+            vault.mkdir()
+            write_config(config_dir, vault)
+            env = clean_env(config_dir)
+            env["INGEST_OUTLOOK_GRAPH_BASE"] = "http://127.0.0.1:1"
+            result = run_fetch(env, "meetings")
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn("BLOQUEADO", result.stderr)
+            self.assertIn("Teams", result.stderr)
+            self.assertFalse((config_dir / "token.json").exists())
+            logs = (config_dir / "log.jsonl").read_text(encoding="utf-8")
+            self.assertEqual(logs.count('"status": "blocked_read_only"'), 1)
+
+    def test_config_bom_tolerated_and_broken_config_reports_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp, fake_server() as server:
+            root = Path(tmp)
+            config_dir, vault = root / "config", root / "vault"
+            vault.mkdir()
+            data = json.dumps({
+                "client_id": CLIENT_ID,
+                "tenant_id": TENANT_ID,
+                "read_only": True,
+                "vault_root": str(vault),
+            })
+            config_dir.mkdir(parents=True, exist_ok=True)
+            (config_dir / "config.json").write_bytes(b"\xef\xbb\xbf" + data.encode("utf-8"))
+            write_token(config_dir)
+            result = run_fetch(clean_env(config_dir, server), "list-calendars")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            (config_dir / "config.json").write_text("{not valid json", encoding="utf-8")
+            broken = run_fetch(clean_env(config_dir, server), "doctor")
+            self.assertEqual(broken.returncode, 1, broken.stdout + broken.stderr)
+            self.assertIn("config.json inválido", broken.stdout + broken.stderr)
+            self.assertNotIn("Traceback", broken.stderr)
 
 
 if __name__ == "__main__":

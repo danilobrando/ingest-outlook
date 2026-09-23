@@ -142,12 +142,12 @@ WINDOWS_RESERVED_NAMES = {
 
 
 def _configure_console_encoding() -> None:
-    """Keep Unicode diagnostics from crashing on legacy Windows code pages."""
+    """Emit UTF-8 diagnostics even on legacy Windows code pages (cp1252)."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             try:
-                reconfigure(errors="replace")
+                reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass
 
@@ -1305,17 +1305,36 @@ def fetch_calendar_events(
                      max_pages=max_pages, context="calendar fetch")
 
 
+def _fromisoformat_compat(text: Any) -> datetime | None:
+    """datetime.fromisoformat shim for Python 3.10, where the parser rejects
+    7-digit fractional seconds (Graph sends '.0000000') and the 'Z' suffix."""
+    s = str(text).strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    head, dot, tail = s.partition(".")
+    if dot:
+        i = 0
+        while i < len(tail) and tail[i].isdigit():
+            i += 1
+        if i > 6:
+            tail = tail[:6] + tail[i:]
+        s = head + dot + tail
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
 def _normalize_graph_datetime(value: Any, timezone_name: Any) -> str:
     """Make Graph's offset-less UTC timestamps unambiguous for ingestion."""
     text = str(value or "")
     zone = str(timezone_name or "").strip().lower()
     if not text or zone not in {"", "utc"} or text.lower().endswith("z"):
         return text
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return text
-    if parsed.tzinfo is not None:
+    parsed = _fromisoformat_compat(text)
+    if parsed is None or parsed.tzinfo is not None:
         return text
     return parsed.replace(microsecond=0).isoformat(timespec="seconds") + "Z"
 

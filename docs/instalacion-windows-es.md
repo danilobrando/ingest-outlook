@@ -16,14 +16,25 @@ Desactiva los alias de la Microsoft Store para Python: **Configuración > Aplica
 Abre PowerShell. Reemplaza `<cargo>`, `<client-id>` y `<tenant-id>`, y ejecuta estos tres comandos:
 
 ```powershell
-git clone --branch v0.5.0 https://github.com/danilobrando/ingest-outlook.git "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook"
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
+git clone --branch v0.5.0 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
 py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py" fix
 ```
+
+El primer comando descarga el conector en una carpeta de tu usuario, fuera del vault. El segundo copia al vault solo lo necesario (sin `.git`, pruebas ni CI) en `<vault>\.claude\skills\ingest-outlook` y guarda la configuración en `%USERPROFILE%\.config\ingest-outlook`, que nunca entra al vault ni al respaldo. Si tu vault está en `C:\cerebros\<cargo>` (perfiles con tilde), usa esa ruta en `-VaultRoot` y en el tercer comando.
 
 El tercer comando abre el navegador. Inicia sesión con tu cuenta corporativa y acepta el acceso. El conector queda limitado a lectura por configuración local y por los permisos concedidos por TI.
 
 Si `py -3` no existe, usa `python`. Si Windows abre la Microsoft Store, revisa los alias de ejecución indicados arriba.
+
+## Actualizar
+
+```powershell
+git -C "$env:LOCALAPPDATA\ingest-outlook" fetch --tags
+git -C "$env:LOCALAPPDATA\ingest-outlook" checkout <nueva-versión>
+```
+
+Luego vuelve a correr el segundo comando de instalación. Tu sesión y tu configuración se conservan.
 
 ## Usarlo con Claude Code
 
@@ -42,7 +53,7 @@ Ingiere una carpeta dedicada de Outlook, por ejemplo `Cerebro`, en vez de todo e
 mail --scope Cerebro --scope-kind folder
 ```
 
-Mueve a esa carpeta únicamente los mensajes que deban entrar al vault. No uses buzones ni calendarios compartidos o delegados.
+Crea `Cerebro` en el **primer nivel** del buzón (clic derecho sobre el nombre de tu cuenta > Nueva carpeta), no dentro de Bandeja de entrada: en esta versión el conector solo encuentra carpetas de primer nivel. Mueve a esa carpeta únicamente los mensajes que deban entrar al vault. No uses buzones ni calendarios compartidos o delegados.
 
 ## Errores comunes
 
