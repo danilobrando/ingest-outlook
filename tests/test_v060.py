@@ -678,6 +678,9 @@ class SyncTests(unittest.TestCase):
                 self.assertTrue(meta.get("empresa"), path)
                 self.assertEqual(meta["empresa"], folder_empresa, path)
                 self.assertNotIn("sintetico", meta)
+                # s3 dates documents from creationDate (YYYY-MM-DD), not from `fecha`
+                self.assertRegex(str(meta.get("creationDate", "")), r"^\d{4}-\d{2}-\d{2}$", path)
+                self.assertEqual(str(meta["creationDate"]), str(meta["fecha"])[:10], path)
 
             # a profile that needs login does not block the other; worst exit code wins
             (env.config / "globex" / "token.json").unlink()
