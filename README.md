@@ -5,11 +5,12 @@
 A Claude Code skill that connects Microsoft 365 (Outlook mail, calendar, Teams meetings) to a local Obsidian-style vault, with **autonomous self-healing**: when something breaks, the user just says "no funciona" and the system diagnoses and repairs itself.
 
 - **Reads**: Outlook mail, calendar events (own + shared), Teams meetings with transcripts
-- **Writes**: send mail, create/update/delete calendar events
+- **Optional writes**: send mail, create/update/delete calendar events when the read-write profile is enabled
 - **Self-heals**: token refresh, scope drift, file permissions, missing dirs all get fixed automatically
-- **Privacy**: everything runs locally, no third-party services, OAuth tokens stored at mode 0600
+- **Privacy**: everything runs locally, no third-party services; tokens use mode 0600 on POSIX and the user-profile ACL on Windows
 - **Audit**: every write action logged to `~/.config/ingest-outlook/audit.jsonl`
 - **Stdlib only**: Python 3.10+, no `pip install` required
+- **Corporate-safe profile**: read-only mode requests only mail/calendar read permissions by default and blocks every write command locally
 
 ## Quick start
 
@@ -24,7 +25,7 @@ cd ingest-outlook
 ```
 
 The installer:
-1. Verifies it is running from the canonical location (`~/second-brain/connectors/ingest-outlook/`)
+1. Warns when it is outside the conventional location (`~/second-brain/connectors/ingest-outlook/`), but continues
 2. Verifies Python 3.10+ is present
 3. Creates the symlink `~/.claude/skills/ingest-outlook` → the cloned repo (Claude Code discovers it through this path)
 4. Creates `~/.config/ingest-outlook/` at mode 0700 for the token cache
@@ -50,6 +51,20 @@ After install:
 
 That's it. The skill is now loaded into your Claude Code agent, and you can interact in natural language.
 
+## Windows (corporate, read-only)
+
+For a managed corporate account, the recommended setup is the read-only profile. Open PowerShell and run these commands, replacing `<cargo>`, `<client-id>` and `<tenant-id>` with the values for your vault and tenant:
+
+```powershell
+git clone --branch v0.5.0 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
+py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py" fix
+```
+
+The third command completes the first browser login.
+
+If `py -3` is unavailable, use `python`, provided it resolves to Python 3.10+ and not a `WindowsApps` Microsoft Store stub. The Application (client) ID and Directory (tenant) ID are public identifiers, not passwords or secrets; the company's IT administrator creates the app in the company's own tenant and gives users those two IDs. See the [Spanish Windows installation guide](docs/instalacion-windows-es.md).
+
 ## What you can ask your Claude Code agent
 
 Once installed, you don't run commands directly. You talk to your agent:
@@ -57,9 +72,9 @@ Once installed, you don't run commands directly. You talk to your agent:
 | You say | Agent does |
 |---|---|
 | "Trae mis correos de hoy" / "fetch today's mail" | Runs `fetch.py mail` and writes to your vault |
-| "Qué reuniones tengo mañana?" | Runs `fetch.py calendar` and shows you |
-| "Mándale un correo a X" | Runs `fetch.py send-mail` (with a confirmation step) |
-| "Agéndame una llamada con Y el jueves a las 3" | Runs `fetch.py event-create` |
+| "Qué reuniones tengo mañana?" | Runs `fetch.py calendar --days 1 --ahead 1` and shows you |
+| "Mándale un correo a X" | Runs `fetch.py send-mail` only in the optional read-write profile |
+| "Agéndame una llamada con Y el jueves a las 3" | Runs `fetch.py event-create` only in the optional read-write profile |
 | "No me llegan correos" / "no funciona" | Silently runs `fetch.py fix`, then either confirms repair or walks you through manual steps |
 
 The trigger phrases for self-healing are documented in [`SKILL.md`](SKILL.md). Both Spanish and English work.
@@ -94,20 +109,23 @@ Single contract file:
 ## Subcommands
 
 ```
-fetch.py mail --scope <folder|query> --scope-kind <folder|query> --days N --vault-root <path>
-fetch.py calendar [--calendar-id <id>] --days N --vault-root <path>
-fetch.py meetings --days N --vault-root <path>            # corporate accounts only
+fetch.py mail --scope <folder|query> --scope-kind <folder|query> --days N [--vault-root <path>]
+fetch.py calendar [--calendar-id <id>] --days N [--ahead 0..60] [--vault-root <path>]
+fetch.py meetings --days N [--vault-root <path>]          # corporate accounts only
 fetch.py list-calendars                                    # own + shared
-fetch.py send-mail --to "x@y.com" --subject "..." --body "..." [--cc, --bcc, --html, --dry-run]
+fetch.py send-mail --to "nobody@example.invalid" --subject "..." --body "..." [--cc, --bcc, --html, --dry-run]
 fetch.py event-create --subject "..." --start ISO --end ISO [--timezone, --attendees, --body, --location]
 fetch.py event-update --event-id <id> [--subject, --start, --end, --add-attendees, --body, --location, --cancel --yes]
 fetch.py event-delete --event-id <id> --yes
 fetch.py doctor [--vault-root <path>]                      # read-only diagnostic
 fetch.py fix [--vault-root <path>] [--quiet]               # diagnose + auto-repair
+fetch.py configure [options] [--show]                       # persistent cross-platform config
 fetch.py version
 ```
 
 All commands accept `--verbose` for debug output to stderr.
+
+`calendar` uses local-day boundaries: `--days 1 --ahead 1` requests today from 00:00 through tomorrow at 23:59:59, then sends the corresponding UTC range to Microsoft Graph. `--ahead` defaults to `0`.
 
 ## Self-healing
 
@@ -117,18 +135,18 @@ The connector's defining feature. When something goes wrong, the user runs ONE c
 python ~/.claude/skills/ingest-outlook/fetch.py fix
 ```
 
-`fix` runs 9 diagnostic checks (env vars, config dir, token freshness, file permissions, network, auth, scope drift, vault writable, log/audit files writable). For each failing check, it either auto-repairs or prints the exact manual command needed. Then it re-verifies.
+`fix` runs 9 diagnostic checks (effective config, config dir, token freshness, file permissions, network, auth, scope drift, vault writable, log/audit files writable). For each failing check, it either auto-repairs or prints the exact manual command needed. Then it re-verifies.
 
 | Failure mode | Auto-fix? |
 |---|---|
 | Config directory missing | Yes (`mkdir -p`) |
-| Token file mode wrong (not 0o600) | Yes (`chmod 600`) |
+| Token file mode wrong (not 0o600) | Yes on POSIX (`chmod 600`); Windows uses the user-profile ACL |
 | Token expired but refresh available | Yes (already automatic at every call) |
 | Token rejected by Graph | Yes (delete + re-OAuth, opens browser) |
 | Scope drift | Yes (re-OAuth with full scope set) |
 | Vault directory missing | Yes (`mkdir -p`) |
 | Log/audit files not writable | Yes |
-| Env var `MS_GRAPH_CLIENT_ID` missing | No (cannot edit shell env from a child process); prints exact command |
+| Client ID missing from config and environment | No; prints the exact `configure` command |
 | Network unreachable | No; prints connection check steps |
 | Clock skew | No (needs admin/sudo); prints System Settings path |
 
@@ -159,12 +177,14 @@ Add this to your `~/.claude/settings.json` so `fix --quiet` runs at every Claude
 ## Privacy & security
 
 - **Local-only**: all data and tokens stay on your machine. No third-party servers.
-- **Token storage**: `~/.config/ingest-outlook/token.json` at file mode `0o600` (owner-only read/write).
+- **Token storage**: `~/.config/ingest-outlook/token.json`, protected by mode `0o600` on POSIX and the user-profile ACL on Windows.
 - **Audit log**: every write action (send-mail, event-create/update/delete) recorded with timestamp, recipients, subject, body hash (not body content) to `~/.config/ingest-outlook/audit.jsonl`.
 - **Read PII safeguards**: ingested mail bodies are truncated to 500 chars in the vault. Calendar bodies to 400 chars. Transcripts are stored verbatim (the whole point).
 - **Sensitive paths warning**: do not let `~/.config/` be synced by cloud providers (iCloud, OneDrive, MDM profiles). The connector's `fix` command detects most cases.
 
 ## Required Microsoft Graph permissions
+
+The recommended corporate read-only profile requests only `User.Read`, `Mail.Read`, `Calendars.Read`, and `offline_access`. It does not request `Mail.Send`, `Calendars.ReadWrite`, shared-calendar access, or Teams transcript access. The broader permissions below apply only to the optional read-write/Teams configuration.
 
 Delegated permissions (act as the signed-in user only, never as application):
 

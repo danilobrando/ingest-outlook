@@ -37,11 +37,27 @@ CALENDAR_BODY_TRUNCATE = 400
 TRUNCATE_MARKER = "\n\n[...truncated]"
 
 _SLUGIFY_RE = re.compile(r"[^a-z0-9]+")
+_WINDOWS_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+DEFAULT_OUTPUT_DIR = "External Inputs/Outlook"
 
 
 # ---------------------------------------------------------------------------
 # Inlined helpers (subset of skills/_shared/connector_utils.py)
 # ---------------------------------------------------------------------------
+
+def configure_console_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
 
 def sha8(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
@@ -49,7 +65,32 @@ def sha8(text: str) -> str:
 
 def slugify(value: str, fallback: str = "unknown") -> str:
     s = _SLUGIFY_RE.sub("-", (value or "").lower()).strip("-")
-    return s or fallback
+    s = s or fallback
+    if s.rstrip(" .").lower() in _WINDOWS_RESERVED:
+        s = f"item-{s}"
+    return s.rstrip(" .") or fallback
+
+
+def output_prefix(payload: dict) -> Path:
+    raw = str(payload.get("output_dir") or DEFAULT_OUTPUT_DIR).replace("\\", "/")
+    path = Path(raw)
+    if path.is_absolute() or not raw or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("output_dir must be a relative path without '..'")
+    for part in path.parts:
+        if re.search(r'[:*?"<>|]', part) or part.endswith((".", " ")):
+            raise ValueError(f"output_dir contains a Windows-unsafe component: {part!r}")
+        if part.lower() in _WINDOWS_RESERVED:
+            raise ValueError(f"output_dir contains a Windows reserved name: {part!r}")
+    return path
+
+
+def shorten_slug_for_path(parent: Path, slug: str, filename: str) -> str:
+    candidate = parent / slug / filename
+    if len(str(candidate)) <= 240:
+        return slug
+    excess = len(str(candidate)) - 240
+    keep = max(8, len(slug) - excess - 9)
+    return f"{slug[:keep].rstrip('-')}-{sha8(slug)}"
 
 
 def yaml_escape(value: Any) -> str:
@@ -84,15 +125,26 @@ def parse_iso(value: str) -> datetime | None:
             return None
 
 
-def to_local_str(value: str) -> str:
+def _apply_timezone_hint(dt: datetime, event_timezone: str | None) -> datetime:
+    zone = str(event_timezone or "").strip().lower()
+    if dt.tzinfo is None and zone in {"", "utc"}:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def to_local_str(value: str, event_timezone: str | None = "") -> str:
     dt = parse_iso(value)
     if not dt:
         return value or ""
+    dt = _apply_timezone_hint(dt, event_timezone)
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-def to_local_sortkey(value: str) -> datetime:
-    return parse_iso(value) or datetime.min.replace(tzinfo=timezone.utc)
+def to_local_sortkey(value: str, event_timezone: str | None = "") -> datetime:
+    dt = parse_iso(value)
+    if not dt:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return _apply_timezone_hint(dt, event_timezone).astimezone(timezone.utc)
 
 
 def truncate_body(text: str, limit: int, marker: str = TRUNCATE_MARKER) -> str:
@@ -224,7 +276,9 @@ def write_mail(payload: dict, target_date: str) -> Path:
     fm = build_mail_frontmatter(payload, count, ids, target_date)
 
     vault_root = Path(payload["vault_root"])
-    out_dir = vault_root / "External Inputs" / "Outlook" / "Mail" / scope_slug
+    parent = vault_root / output_prefix(payload) / "Mail"
+    scope_slug = shorten_slug_for_path(parent, scope_slug, f"{target_date}.md")
+    out_dir = parent / scope_slug
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{target_date}.md"
     out_path.write_text(fm + body, encoding="utf-8")
@@ -237,7 +291,9 @@ def write_mail(payload: dict, target_date: str) -> Path:
 
 def render_calendar_body(payload: dict) -> tuple[str, int, list[str]]:
     events = list(payload.get("events") or [])
-    events.sort(key=lambda e: to_local_sortkey(e.get("start") or ""))
+    events.sort(key=lambda e: to_local_sortkey(
+        e.get("start") or "", e.get("timezone")
+    ))
 
     parts: list[str] = []
     ids: list[str] = []
@@ -246,8 +302,8 @@ def render_calendar_body(payload: dict) -> tuple[str, int, list[str]]:
         if ev_id:
             ids.append(ev_id)
         subject = ev.get("subject") or "(no subject)"
-        start = to_local_str(ev.get("start") or "")
-        end = to_local_str(ev.get("end") or "")
+        start = to_local_str(ev.get("start") or "", ev.get("timezone"))
+        end = to_local_str(ev.get("end") or "", ev.get("timezone"))
         organizer = ev.get("organizer") or "(unknown organizer)"
         attendees = ev.get("attendees") or []
         location = ev.get("location") or ""
@@ -295,7 +351,11 @@ def build_calendar_frontmatter(
 ) -> str:
     days = int(payload.get("days") or 7)
     ingested_at = payload.get("ingested_at_iso") or now_iso()
-    start_date, end_date = date_range_strs(target_date, days)
+    payload_range = payload.get("date_range")
+    if isinstance(payload_range, (list, tuple)) and len(payload_range) == 2:
+        start_date, end_date = str(payload_range[0]), str(payload_range[1])
+    else:
+        start_date, end_date = date_range_strs(target_date, days)
 
     lines = [
         "---",
@@ -330,7 +390,7 @@ def write_calendar(payload: dict, target_date: str) -> Path:
     fm = build_calendar_frontmatter(payload, count, ids, target_date)
 
     vault_root = Path(payload["vault_root"])
-    out_dir = vault_root / "External Inputs" / "Outlook" / "Calendar"
+    out_dir = vault_root / output_prefix(payload) / "Calendar"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{target_date}.md"
     out_path.write_text(fm + body, encoding="utf-8")
@@ -344,7 +404,9 @@ def write_calendar(payload: dict, target_date: str) -> Path:
 def render_meetings_body(payload: dict) -> tuple[str, int, list[str], int]:
     """Return (body, meeting_count, meeting_ids, transcript_count)."""
     meetings = list(payload.get("meetings") or [])
-    meetings.sort(key=lambda m: to_local_sortkey(m.get("start") or ""))
+    meetings.sort(key=lambda m: to_local_sortkey(
+        m.get("start") or "", m.get("timezone")
+    ))
 
     parts: list[str] = []
     ids: list[str] = []
@@ -355,8 +417,8 @@ def render_meetings_body(payload: dict) -> tuple[str, int, list[str], int]:
         if ev_id:
             ids.append(ev_id)
         subject = mt.get("subject") or "(no subject)"
-        start = to_local_str(mt.get("start") or "")
-        end = to_local_str(mt.get("end") or "")
+        start = to_local_str(mt.get("start") or "", mt.get("timezone"))
+        end = to_local_str(mt.get("end") or "", mt.get("timezone"))
         organizer = mt.get("organizer") or "(unknown organizer)"
         attendees = mt.get("attendees") or []
         join_url = mt.get("online_meeting_url") or ""
@@ -454,7 +516,7 @@ def write_meetings(payload: dict, target_date: str) -> Path:
     fm = build_meetings_frontmatter(payload, count, ids, transcript_count, target_date)
 
     vault_root = Path(payload["vault_root"])
-    out_dir = vault_root / "External Inputs" / "Outlook" / "Meetings"
+    out_dir = vault_root / output_prefix(payload) / "Meetings"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{target_date}.md"
     out_path.write_text(fm + body, encoding="utf-8")
@@ -466,6 +528,7 @@ def write_meetings(payload: dict, target_date: str) -> Path:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    configure_console_encoding()
     parser = argparse.ArgumentParser(
         description=(
             "Outlook/M365-to-vault normalizer. Reads a JSON payload on stdin "
@@ -479,7 +542,13 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        raw = sys.stdin.read()
+        raw_bytes = sys.stdin.buffer.read()
+        try:
+            raw = raw_bytes.decode("utf-8")
+            if raw.startswith("\ufeff"):
+                raw = raw_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raw = raw_bytes.decode("utf-8-sig")
     except Exception as e:
         print(f"ERROR: failed to read stdin: {e}", file=sys.stderr)
         return 2
@@ -500,20 +569,39 @@ def main() -> int:
 
     kind = payload.get("kind") or "mail"  # back-compat: legacy mail payloads omitted kind
     target_date = args.target_date or payload.get("target_date") or today_iso()
+    try:
+        parsed_target = datetime.strptime(str(target_date), "%Y-%m-%d")
+        if parsed_target.strftime("%Y-%m-%d") != str(target_date):
+            raise ValueError
+    except ValueError:
+        print("ERROR: target date must use YYYY-MM-DD format", file=sys.stderr)
+        return 2
 
     if kind == "mail":
         if "folder_or_query" not in payload:
             print("ERROR: mail payload missing folder_or_query", file=sys.stderr)
             return 2
-        out_path = write_mail(payload, target_date)
+        try:
+            out_path = write_mail(payload, target_date)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         count = len(payload.get("messages") or [])
         print(f"Wrote {count} message(s) to {out_path}")
     elif kind == "calendar":
-        out_path = write_calendar(payload, target_date)
+        try:
+            out_path = write_calendar(payload, target_date)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         count = len(payload.get("events") or [])
         print(f"Wrote {count} event(s) to {out_path}")
     elif kind == "meetings":
-        out_path = write_meetings(payload, target_date)
+        try:
+            out_path = write_meetings(payload, target_date)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
         count = len(payload.get("meetings") or [])
         transcripts = sum(len(m.get("transcripts") or []) for m in payload.get("meetings") or [])
         print(f"Wrote {count} meeting(s), {transcripts} transcript(s) to {out_path}")

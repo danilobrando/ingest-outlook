@@ -11,8 +11,8 @@
 #   ./install.sh
 #
 # What it does:
-#   1. Verifies it is running from inside ~/second-brain/connectors/<name>/
-#      (the canonical location; see ~/second-brain/connectors/README.md)
+#   1. Warns when it is outside ~/second-brain/connectors/<name>/
+#      (the conventional location; other locations still work)
 #   2. Verifies Python 3.10+ is available
 #   3. Symlinks ~/.claude/skills/<name> -> the current directory
 #      (Claude Code discovers skills via ~/.claude/skills/; we keep the files
@@ -45,28 +45,23 @@ step()  { printf "\n  -> %s\n" "$1"; }
 printf "ingest-outlook installer\n"
 printf "========================\n"
 
-# --- Step 1: Verify location matches the standard ---
+# --- Step 1: Check the conventional location (other locations still work) ---
 step "Verifying install location"
 if [[ "$(dirname "$SCRIPT_DIR")" != "$EXPECTED_PARENT" ]]; then
-    fail "$(cat <<EOF
+    warn "$(cat <<EOF
 
-Standard violation: this connector must live under
+This connector is outside the conventional location
   $EXPECTED_PARENT/
 
 Currently running from:
   $SCRIPT_DIR
 
-To fix, move (or re-clone) the repo to the canonical location:
-  mkdir -p $EXPECTED_PARENT
-  mv "$SCRIPT_DIR" "$EXPECTED_PARENT/$CONNECTOR_NAME"
-  cd "$EXPECTED_PARENT/$CONNECTOR_NAME"
-  ./install.sh
-
-(See $HOME/second-brain/connectors/README.md for the connector standard.)
+Installation will continue; ingest-outlook works from any folder.
 EOF
 )"
+else
+    ok "Running from $SCRIPT_DIR"
 fi
-ok "Running from $SCRIPT_DIR"
 
 # --- Step 2: Verify Python version ---
 step "Verifying Python 3.10+"

@@ -1,13 +1,21 @@
 ---
 name: ingest-outlook
-description: Outlook/Microsoft 365 connector with read+write capabilities AND autonomous self-healing. Subcommands - mail/calendar/meetings/list-calendars (read), send-mail/event-create/event-update/event-delete (write), doctor/fix (recovery), version. **AUTO-RECOVERY TRIGGER: when the user reports ANY issue related to Outlook, Microsoft 365, correo, mail, email, calendario, calendar, reuniones, meetings, or Teams — including vague phrases like "no funciona", "no me llegan correos", "está raro", "no veo mis reuniones", "no puedo enviar", "error con el mail", "algo no anda con mi outlook" — this skill MUST be invoked FIRST and the orchestrator MUST silently run `fetch.py fix --vault-root <user-vault>` BEFORE responding to the user. The agent parses the fix output and either confirms the auto-repair OR walks the user through the manual steps conversationally.** Read subcommands write to External Inputs/Outlook/{Mail,Calendar,Meetings}/.../<date>.md, idempotent per day. Write subcommands print result to stdout, support --dry-run, and event-delete + event-update --cancel require --yes. Works for personal Microsoft accounts and corporate Microsoft 365 tenants.
+description: Outlook/Microsoft 365 connector for Windows, macOS, and Linux, with a recommended corporate read-only profile plus optional read-write capabilities AND autonomous self-healing. Subcommands - configure, mail/calendar/meetings/list-calendars (read), send-mail/event-create/event-update/event-delete (write profile only), doctor/fix (recovery), version. **AUTO-RECOVERY TRIGGER: when the user reports ANY issue related to Outlook, Microsoft 365, correo, mail, email, calendario, calendar, reuniones, meetings, or Teams — including vague phrases like "no funciona", "no me llegan correos", "está raro", "no veo mis reuniones", "no puedo enviar", "error con el mail", "algo no anda con mi outlook" — this skill MUST be invoked FIRST and the orchestrator MUST silently run `fetch.py fix --vault-root <user-vault>` BEFORE responding to the user. The agent parses the fix output and either confirms the auto-repair OR walks the user through the manual steps conversationally.** Read subcommands write to the configured Outlook output directory, idempotent per day. In read-only mode, write subcommands are unavailable and the agent must never offer them.
 ---
 
 # ingest-outlook, Outlook + Microsoft 365 connector
 
 Ingests Outlook mail, calendar events, and Teams meetings (with transcripts) into the vault as markdown the graphify pipeline can read and the rest of the AI Brain Starter substrate can act on. **Also acts as the autonomous recovery layer**: when the user reports anything wrong with their M365 setup, this skill silently self-diagnoses and self-repairs before bothering the user.
 
-Same family as ingest-gmail, ingest-slack, ingest-linear. Same output contract under `External Inputs/<Source>/...`. The only architectural difference is that there is no Microsoft Graph MCP, so the data fetch runs inside `${SKILL_ROOT}/fetch.py` (OAuth2 + Microsoft Graph REST) instead of via MCP tool calls. The orchestrator pipes `fetch.py` stdout into `ingest.py` stdin.
+Same family as ingest-gmail, ingest-slack, ingest-linear. Same output contract under `External Inputs/<Source>/...`. The only architectural difference is that there is no Microsoft Graph MCP, so the data fetch runs locally through Microsoft Graph REST. The orchestrator pipes `fetch.py` stdout into `ingest.py` stdin.
+
+## Runtime paths and interpreter
+
+The skill base directory is the directory Claude Code reports when it loads this skill. Refer to it below as `<skill-base>`; do not assume `~/.claude/skills` or any other hardcoded location.
+
+- macOS/Linux: use `python3`.
+- Windows: use `python` or `py -3`, whichever resolves to Python 3.10+. Never use a `python3`/`python` executable whose path contains `WindowsApps`, because that is the Microsoft Store stub.
+- Replace `<python>` and `<skill-base>` in every example with those resolved values.
 
 ## AUTO-RECOVERY POLICY (read this first)
 
@@ -18,7 +26,7 @@ Same family as ingest-gmail, ingest-slack, ingest-linear. Same output contract u
 If the user's message contains ANY signal that something is wrong with their Microsoft 365 / Outlook / Teams environment, your **first action — before any clarifying question, before any other tool call — is to run**:
 
 ```bash
-python ${SKILL_ROOT}/fetch.py fix --vault-root <user-vault-root>
+<python> "<skill-base>/fetch.py" fix [--vault-root <user-vault-root>]
 ```
 
 Run this silently. Do NOT show the user the command. Do NOT explain you're "running diagnostics". Just do it and react to the output.
@@ -101,7 +109,7 @@ Then provide a concise problem summary (NOT a log dump) ready to forward.
 ## When to use
 
 - User says `/ingest-outlook mail <folder-or-query> [--days N]`
-- User says `/ingest-outlook calendar [--days N]`
+- User says `/ingest-outlook calendar [--days N] [--ahead N]`
 - User says `/ingest-outlook meetings [--days N]` (corporate accounts only)
 - User asks to capture, sync, ingest, or pull Outlook mail, calendar, or Teams meetings into the vault
 
@@ -114,14 +122,24 @@ Do NOT use for:
 
 | Subcommand | Read/Write | Scope required | Output |
 |---|---|---|---|
-| `mail` | Read | `Mail.Read` | Vault file at `External Inputs/Outlook/Mail/<folder>/<date>.md` |
-| `calendar` | Read | `Calendars.Read` (own) or `Calendars.Read.Shared` (shared) | Vault file at `External Inputs/Outlook/Calendar/<date>.md` |
-| `meetings` | Read | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (corporate only) | Vault file at `External Inputs/Outlook/Meetings/<date>.md` |
-| `list-calendars` | Read | `Calendars.Read.Shared` | Human-readable list on stdout |
+| `mail` | Read | `Mail.Read` | Vault file under configured output `/Mail/<folder>/<date>.md` |
+| `calendar --days N [--ahead 0..60]` | Read | `Calendars.Read` (own). Shared calendars only when `shared_calendars` is enabled. Read-only without that flag sees own calendars only | Vault file under configured output `/Calendar/<date>.md` |
+| `meetings` | Read | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (only when an admin enabled `teams`) | Vault file under configured output `/Meetings/<date>.md` |
+| `list-calendars` | Read | `Calendars.Read`; shared entries require `shared_calendars` (`Calendars.Read.Shared`). Without that, read-only mode lists own calendars only | Human-readable list on stdout |
 | `send-mail` | **Write** | `Mail.Send` | Confirmation line on stdout |
 | `event-create` | **Write** | `Calendars.ReadWrite` | Event id + subject on stdout |
 | `event-update` | **Write** | `Calendars.ReadWrite` | Updated event id + changed fields on stdout |
 | `event-delete` | **Write** | `Calendars.ReadWrite` | Confirmation line on stdout, requires `--yes` |
+
+### Read-only profile contract
+
+When the effective configuration has `read_only: true`, `send-mail`, `event-create`, `event-update`, and `event-delete` do not exist as capabilities for the agent. Do not offer, suggest, simulate, or attempt those commands, including with `--dry-run`. The connector enforces this locally before requesting a token, but the agent must also honor the policy at planning time. Do not access shared or delegated mailboxes/calendars unless `shared_calendars` was explicitly enabled by the operator.
+
+In the read-only profile without `shared_calendars`, `list-calendars` and `calendar` only see the signed-in user's own calendars. They do not list or read calendars that were shared with that user.
+
+`meetings` exists only when an administrator enabled Teams for this connector (`teams: true`, which needs admin consent). In the read-only profile without Teams, do not offer or attempt `meetings`.
+
+Exit code 3 means the organization read-only policy blocked the command before any Microsoft call. It is not a connector error, a bad login, or something `fix` can repair. Explain that to the user as a company policy: the action is not allowed here. Do not describe it as a failure or a bug.
 
 ## Personal vs corporate Microsoft accounts
 
@@ -130,8 +148,8 @@ Do NOT use for:
 | `MS_GRAPH_TENANT_ID` | `common` (default) or `consumers` | `<tenant-uuid>` from IT admin |
 | Mail | Available | Available |
 | Calendar | Available | Available |
-| Teams meetings + transcripts | **Not available** | Available (requires admin consent on `OnlineMeetingTranscript.Read.All`) |
-| Default scopes | `User.Read Mail.Read Calendars.Read offline_access` | `User.Read Mail.Read Calendars.Read OnlineMeetings.Read OnlineMeetingTranscript.Read.All offline_access` |
+| Teams meetings + transcripts | **Not available** | Available only when `teams: true` (requires admin consent on `OnlineMeetingTranscript.Read.All`) |
+| Recommended read-only scopes | `User.Read Mail.Read Calendars.Read offline_access` | `User.Read Mail.Read Calendars.Read offline_access` |
 
 The `meetings` subcommand prints a warning and returns zero results on personal tenants.
 
@@ -145,7 +163,7 @@ Operator obligations:
 2. **Never ingest a shared mailbox you do not own.** Delegated mailboxes, shared inboxes, and "On behalf of" access scenarios require the inbox owner's explicit consent.
 3. **Scrub before sharing.** If a file ever needs to leave the vault, scrub names, addresses, phone numbers, account numbers, and message bodies first.
 4. **Mail bodies are truncated to 500 chars** as a volume cap, not a redaction. Calendar bodies are truncated to 400 chars. **Transcripts are stored verbatim** because truncating defeats the purpose of capturing meeting content. Treat transcripts as the most sensitive output of this skill.
-5. **Tokens stay local.** OAuth tokens live in `~/.config/ingest-outlook/token.json` with mode 0600. Do not commit, copy, or share that file.
+5. **Tokens stay local.** OAuth tokens live in the configured state directory (default `~/.config/ingest-outlook/token.json`). POSIX uses mode 0600; Windows relies on the user-profile ACL. Do not commit, copy, or share that file.
 
 If any of these obligations is unclear, do not run the skill. Ask first.
 
@@ -159,10 +177,10 @@ Before the first run:
    - For personal use: "Personal Microsoft accounts only" (or "Accounts in any organizational directory and personal Microsoft accounts")
    - For corporate use: "Accounts in this organizational directory only (Single tenant)"
 4. Under "API permissions", add delegated Microsoft Graph permissions:
-   - Read (always): `User.Read`, `Mail.Read`, `offline_access`
-   - Calendar read+write (own + shared): `Calendars.ReadWrite`, `Calendars.Read.Shared`
-   - Send mail: `Mail.Send`
-   - Corporate + Teams meeting transcripts: `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (the second requires admin consent)
+   - Recommended read-only profile: only `User.Read`, `Mail.Read`, `Calendars.Read`, `offline_access`
+   - Optional read-write profile: add `Mail.Send` and use `Calendars.ReadWrite`
+   - Optional shared calendars: add `Calendars.Read.Shared`
+   - Optional corporate Teams transcripts: add `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (the second requires admin consent)
 5. Copy the Application (client) ID and (for corporate) the Directory (tenant) ID. Export them:
 
    ```bash
@@ -171,7 +189,13 @@ Before the first run:
    # export MS_GRAPH_TENANT_ID="<tenant-uuid>"              # corporate
    ```
 
-   Add to `~/.zshrc` so they persist. A starter template is in `${SKILL_ROOT}/.env.example`.
+   On macOS/Linux, add them to `~/.zshrc` so they persist. A starter template is in `<skill-base>/.env.example`. On any platform, prefer the persistent config command:
+
+   ```text
+   <python> "<skill-base>/fetch.py" configure --client-id <guid> --tenant-id <guid-or-alias> --vault-root "<vault-path>" --read-only
+   ```
+
+   Use `configure --show` to inspect each effective value and whether it came from an argument, environment variable, config file, or default.
 
 The first run will open the browser to complete OAuth authorization. Subsequent runs use a cached refresh token. To force re-authorization (e.g. after scope changes), delete `~/.config/ingest-outlook/token.json`.
 
@@ -179,28 +203,28 @@ The first run will open the browser to complete OAuth authorization. Subsequent 
 
 The skill is a thin orchestrator. Two Python scripts do the work:
 
-- `${SKILL_ROOT}/fetch.py` runs OAuth2 + Microsoft Graph queries, emits JSON to stdout
-- `${SKILL_ROOT}/ingest.py` reads the JSON, writes the vault file
+- `<skill-base>/fetch.py` runs OAuth2 + Microsoft Graph queries, emits JSON to stdout
+- `<skill-base>/ingest.py` reads the JSON, writes the vault file
 
 The subcommand is the first positional arg to `fetch.py`:
 
 ```bash
-python "${SKILL_ROOT}/fetch.py" <mail|calendar|meetings> \
+<python> "<skill-base>/fetch.py" <mail|calendar|meetings> \
     [subcommand-specific args] \
     --days N \
     --vault-root "<path>" \
-  | python "${SKILL_ROOT}/ingest.py"
+  | <python> "<skill-base>/ingest.py"
 ```
 
 ### Subcommand: mail
 
 ```bash
-python "${SKILL_ROOT}/fetch.py" mail \
+<python> "<skill-base>/fetch.py" mail \
     --scope "<folder-name-or-query>" \
     --scope-kind <folder|query> \
     --days N \
     --vault-root "<vault-path>" \
-  | python "${SKILL_ROOT}/ingest.py"
+  | <python> "<skill-base>/ingest.py"
 ```
 
 Resolves the scope as a mail folder (`displayName eq <scope>` against `/me/mailFolders`) or a free-text `$search` query. Output: `External Inputs/Outlook/Mail/<scope-slug>/<YYYY-MM-DD>.md`.
@@ -208,24 +232,27 @@ Resolves the scope as a mail folder (`displayName eq <scope>` against `/me/mailF
 ### Subcommand: calendar
 
 ```bash
-python "${SKILL_ROOT}/fetch.py" calendar \
+<python> "<skill-base>/fetch.py" calendar \
     --days N \
+    --ahead N \
     --vault-root "<vault-path>" \
-  | python "${SKILL_ROOT}/ingest.py"
+  | <python> "<skill-base>/ingest.py"
 ```
 
-Pulls `/me/calendarView` between (now - N days) and now. Includes recurring instances expanded. Output: `External Inputs/Outlook/Calendar/<YYYY-MM-DD>.md`.
+Pulls `/me/calendarView` from the start of the local day `(today - days + 1)` through the end of the local day `(today + ahead)`. `--ahead` defaults to `0` and accepts `0..60`. For "¿qué reuniones tengo mañana?", use `calendar --days 1 --ahead 1`, which covers today at 00:00 local through tomorrow at 23:59:59 local. Includes recurring instances expanded. Output: `External Inputs/Outlook/Calendar/<YYYY-MM-DD>.md`.
 
 ### Subcommand: meetings
 
 ```bash
-python "${SKILL_ROOT}/fetch.py" meetings \
+<python> "<skill-base>/fetch.py" meetings \
     --days N \
     --vault-root "<vault-path>" \
-  | python "${SKILL_ROOT}/ingest.py"
+  | <python> "<skill-base>/ingest.py"
 ```
 
 For each calendar event with `onlineMeeting.joinUrl`, resolves the `onlineMeeting` object, lists transcripts, and downloads transcript content as VTT. Output: `External Inputs/Outlook/Meetings/<YYYY-MM-DD>.md`.
+
+`meetings` is available only if an administrator enabled Teams (`teams: true`). Read-only mode without Teams exits 3 before requesting a token. Tell the user that is company policy, not an error.
 
 Personal Microsoft accounts: the subcommand prints a warning and emits a zero-meeting payload. The vault file is still written for idempotency.
 
@@ -245,12 +272,12 @@ When invoked:
 
 1. Parse the subcommand and arguments.
 2. For `mail`: detect scope kind. If the scope is wrapped in quotes, contains whitespace, or uses Outlook KQL operators (`from:`, `to:`, `subject:`, `hasAttachment:`, `received:`), treat it as a query. Otherwise treat it as a folder name.
-3. Default `--vault-root` to the user's vault root (e.g. `/Users/<user>/second-brain` or whatever the operator's vault path is); ask if unknown.
+3. Omit `--vault-root` when it is present in effective configuration. Otherwise use the user's vault root; ask if unknown.
 4. Run the pipeline:
 
    ```bash
-   python "${SKILL_ROOT}/fetch.py" <sub> [args] --days N --vault-root "<vault-path>" \
-     | python "${SKILL_ROOT}/ingest.py"
+   <python> "<skill-base>/fetch.py" <sub> [args] --days N [--vault-root "<vault-path>"] \
+     | <python> "<skill-base>/ingest.py"
    ```
 
 5. Surface the summary line printed by `ingest.py`.
@@ -337,7 +364,7 @@ The strongest form of self-healing is **preventive**: run `fix --quiet` automati
         "hooks": [
           {
             "type": "command",
-            "command": "python ~/.claude/skills/ingest-outlook/fetch.py fix --quiet --vault-root ~/second-brain || true"
+            "command": "<python> \"<skill-base>/fetch.py\" fix --quiet || true"
           }
         ]
       }
@@ -407,7 +434,7 @@ For a corporate install, set `MS_GRAPH_TENANT_ID` to the corporate tenant UUID (
 The connector ships a self-healing entry point. **When ANYTHING is wrong**, run:
 
 ```bash
-python ~/.claude/skills/ingest-outlook/fetch.py fix
+<python> "<skill-base>/fetch.py" fix
 ```
 
 What it does:
@@ -440,6 +467,9 @@ Every error message printed by the connector ends with a hint pointing to `fix`.
 - Mail `$search` returns zero results: empty payload, `ingest.py` writes a `message_count: 0` file. Not a failure.
 - Calendar/meetings window has zero items: empty payload, vault file still written for idempotency.
 - Teams not available on personal tenant: `meetings` subcommand warns + emits empty payload.
+- Read-only profile without Teams: `meetings` exits 3 (`blocked_read_only`) before requesting a token. That is organization policy, not a connector error. Do not run `fix` to "repair" it.
+- Read-only profile without `shared_calendars`: `calendar` and `list-calendars` see only the user's own calendars.
+- Exit code 3 from a write command or from `meetings`: explain the company policy. Do not treat it as a bug.
 - Transcript not available for a meeting: that meeting's transcript array is empty; meeting still in output.
 - HTTP 429 throttling: respects `Retry-After`, retries up to 3 times.
 - AADSTS error codes (50158/50173/70008/65001/90094/50076/etc.): the `_post_token` handler maps known codes to a human-readable next action.
