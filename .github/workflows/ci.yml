@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -19,6 +19,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Compile all modules
+        run: python -m py_compile fetch.py ingest.py cerebro_lock.py sync_cerebro.py schedule_win.py schedule_mac.py tests/fake_graph.py tests/support.py
 
       - name: Run unit and integration tests
         run: python -m unittest discover -s tests -v
@@ -87,4 +90,94 @@ jobs:
           py -3 $specialFetch configure --show
           if ($LASTEXITCODE -ne 0) {
             throw "configure --show failed for the spaced path with exit code $LASTEXITCODE"
+          }
+
+      - name: Windows cerebro end-to-end (fake Graph, two profiles in parallel, scheduled task)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $clientId = "11111111-1111-4111-8111-111111111111"
+          $tenantId = "22222222-2222-4222-8222-222222222222"
+          $port = 8799
+          $python = (Get-Command python).Source
+          $env:INGEST_OUTLOOK_CONFIG_DIR = [System.IO.Path]::Combine($env:RUNNER_TEMP, "cerebro config")
+          $env:INGEST_OUTLOOK_GRAPH_BASE = "http://127.0.0.1:$port"
+          $env:INGEST_OUTLOOK_AUTHORITY_BASE = "http://127.0.0.1:$port"
+          $env:CEREBRO_LOCK_POLL_SECONDS = "0.5"
+
+          $server = Start-Process -FilePath $python -ArgumentList @("tests\fake_graph.py", "--port", "$port", "--scenario", "basic") -PassThru -NoNewWindow
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              try {
+                Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri ("http://127.0.0.1:$port/" + '$metadata') | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $ready) { throw "fake Graph did not start on port $port" }
+
+            $vault = [System.IO.Path]::Combine($env:RUNNER_TEMP, "cerebros", "cargo con tilde é")
+            $profiles = @("acme", "globex")
+            foreach ($empresa in $profiles) {
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+                -VaultRoot $vault -Profile $empresa -Empresa $empresa -Layout cerebro `
+                -ClientId $clientId -TenantId $tenantId -ReadOnly
+              if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed for $empresa with exit code $LASTEXITCODE" }
+              $profileDir = [System.IO.Path]::Combine($env:INGEST_OUTLOOK_CONFIG_DIR, $empresa)
+              & $python tests\fake_graph.py --seed-token $profileDir
+              if ($LASTEXITCODE -ne 0) { throw "seed-token failed for $empresa with exit code $LASTEXITCODE" }
+            }
+
+            $fetch = [System.IO.Path]::Combine($vault, ".claude", "skills", "ingest-outlook", "fetch.py")
+            # Two sync processes against the same vault at once: one waits for the lock.
+            $procs = @()
+            foreach ($empresa in $profiles) {
+              $proc = Start-Process -FilePath $python -ArgumentList ('"' + $fetch + '" sync --profile ' + $empresa) -PassThru -NoNewWindow
+              $null = $proc.Handle  # keeps ExitCode readable after exit (PowerShell 5.1)
+              $procs += $proc
+            }
+            foreach ($proc in $procs) {
+              if (-not $proc.WaitForExit(240000)) { throw "sync did not finish in 4 minutes" }
+              if ($proc.ExitCode -ne 0) { throw "sync exited with code $($proc.ExitCode)" }
+            }
+
+            foreach ($empresa in $profiles) {
+              $mailDir = [System.IO.Path]::Combine($vault, "raw", "entradas", "correo", $empresa)
+              $files = @(Get-ChildItem -LiteralPath $mailDir -Recurse -Filter *.md)
+              if ($files.Count -lt 1) { throw "no mail files under $mailDir" }
+              foreach ($file in $files) {
+                $text = [System.IO.File]::ReadAllText($file.FullName)
+                if ($text -notmatch "(?m)^empresa: $empresa$") { throw "empresa missing or wrong in $($file.FullName)" }
+              }
+            }
+            $log = [System.IO.Path]::Combine($vault, ".claude", "system3", "logs", "ingesta.log")
+            $lines = @([System.IO.File]::ReadAllLines($log) | Where-Object { $_ -match "estado ok" })
+            if ($lines.Count -ne 2) { throw "expected 2 'estado ok' lines in $log, found $($lines.Count)" }
+            $lock = [System.IO.Path]::Combine($vault, ".claude", "system3", "cerebro.lock")
+            if (Test-Path -LiteralPath $lock) { throw "residual vault lock at $lock" }
+
+            & $python $fetch sync --all --vault-root $vault
+            if ($LASTEXITCODE -ne 0) { throw "sync --all failed with exit code $LASTEXITCODE" }
+
+            & $python $fetch schedule install --profile acme
+            if ($LASTEXITCODE -ne 0) { throw "schedule install failed with exit code $LASTEXITCODE" }
+            $task = Get-ScheduledTask -TaskName "Cerebro - ingesta" -TaskPath "\Rewired\" -ErrorAction SilentlyContinue
+            if (-not $task) { throw "Get-ScheduledTask did not find \Rewired\Cerebro - ingesta" }
+            $action = $task.Actions | Select-Object -First 1
+            if ($action.Execute -notlike "*pythonw.exe") { throw "task does not run pythonw.exe: $($action.Execute)" }
+            if ($action.Arguments -notlike "*sync*") { throw "task arguments do not run sync: $($action.Arguments)" }
+            if ($task.Principal.LogonType -ne "Interactive") { throw "task is not 'only when the user is logged on'" }
+            & $python $fetch schedule status
+            if ($LASTEXITCODE -ne 0) { throw "schedule status failed with exit code $LASTEXITCODE" }
+            & $python $fetch schedule remove
+            if ($LASTEXITCODE -ne 0) { throw "schedule remove failed with exit code $LASTEXITCODE" }
+            if (Get-ScheduledTask -TaskName "Cerebro - ingesta" -TaskPath "\Rewired\" -ErrorAction SilentlyContinue) {
+              throw "the task is still registered after schedule remove"
+            }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
           }

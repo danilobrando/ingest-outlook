@@ -7,7 +7,24 @@ param(
     [string]$TenantId,
 
     # Recommended for corporate tenants: disables every Graph write command.
-    [switch]$ReadOnly
+    [switch]$ReadOnly,
+
+    # v0.6 "cerebro" layout. One profile per Microsoft 365 tenant (1..N per
+    # vault). -Profile is an alias so $PROFILE (PowerShell) is not shadowed.
+    [Alias("Profile")]
+    [string]$ProfileName,
+    [string]$Empresa,
+    [ValidateSet("legacy", "cerebro")]
+    [string]$Layout,
+    # Teams transcripts (needs admin consent + the tenant transcript switch).
+    [switch]$Teams,
+    # Register the automatic sync (Windows: \Rewired\Cerebro - ingesta).
+    [switch]$Schedule,
+    # Optional overrides of the vault-relative paths (defaults: raw/entradas,
+    # .claude/system3/cerebro.lock, .claude/system3/logs/ingesta.log).
+    [string]$RawRoot,
+    [string]$LockPath,
+    [string]$IngestLogPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,6 +105,13 @@ function Find-RealPython {
 Write-Host "ingest-outlook Windows installer"
 Write-Host "================================"
 
+if ($Layout -eq "cerebro" -and [string]::IsNullOrWhiteSpace($Empresa)) {
+    throw "-Layout cerebro requires -Empresa <slug> (the short company name written in every raw file)."
+}
+if (-not [string]::IsNullOrWhiteSpace($ProfileName) -and $ProfileName -notmatch '^[a-z0-9-]{1,32}$') {
+    throw "-Profile must be a slug: lowercase letters, digits and dashes (max 32)."
+}
+
 Write-Step "Detecting Python 3.10+"
 $Python = Find-RealPython
 $versionArgs = @($Python.Prefix) + "--version"
@@ -120,6 +144,9 @@ if (-not [string]::IsNullOrWhiteSpace($env:INGEST_OUTLOOK_CONFIG_DIR)) {
 } else {
     $ConfigDir = Join-Literal $env:USERPROFILE ".config\ingest-outlook"
 }
+if (-not [string]::IsNullOrWhiteSpace($ProfileName)) {
+    $ConfigDir = Join-Literal $ConfigDir $ProfileName
+}
 Write-Step "Preparing configuration in $ConfigDir"
 New-DirectoryLiteral $ConfigDir | Out-Null
 
@@ -127,10 +154,18 @@ $Fetch = Join-Literal $TargetDir "fetch.py"
 if (-not (Test-Path -LiteralPath $Fetch)) {
     throw "fetch.py was not installed at $Fetch"
 }
-$ConfigureArgs = @($Fetch, "configure", "--vault-root", $ResolvedVault)
+$ConfigureArgs = @($Fetch)
+if ($ProfileName) { $ConfigureArgs += @("--profile", $ProfileName) }
+$ConfigureArgs += @("configure", "--vault-root", $ResolvedVault)
 if ($ClientId) { $ConfigureArgs += @("--client-id", $ClientId) }
 if ($TenantId) { $ConfigureArgs += @("--tenant-id", $TenantId) }
 if ($ReadOnly) { $ConfigureArgs += "--read-only" }
+if ($Layout) { $ConfigureArgs += @("--layout", $Layout) }
+if ($Empresa) { $ConfigureArgs += @("--empresa", $Empresa) }
+if ($Teams) { $ConfigureArgs += "--teams" }
+if ($RawRoot) { $ConfigureArgs += @("--raw-root", $RawRoot) }
+if ($LockPath) { $ConfigureArgs += @("--lock-path", $LockPath) }
+if ($IngestLogPath) { $ConfigureArgs += @("--ingest-log-path", $IngestLogPath) }
 $runConfigureArgs = @($Python.Prefix) + $ConfigureArgs
 & $Python.Exe @runConfigureArgs
 if ($LASTEXITCODE -ne 0) { throw "fetch.py configure failed with exit code $LASTEXITCODE" }
@@ -140,7 +175,25 @@ $runVersionArgs = @($Python.Prefix) + @($Fetch, "version")
 & $Python.Exe @runVersionArgs
 if ($LASTEXITCODE -ne 0) { throw "fetch.py version failed with exit code $LASTEXITCODE" }
 
+if ($Schedule) {
+    Write-Step "Scheduling the automatic sync (one task per vault: sync --all)"
+    $runScheduleArgs = @($Python.Prefix) + @($Fetch, "schedule", "install", "--vault-root", $ResolvedVault)
+    & $Python.Exe @runScheduleArgs
+    $scheduleCode = $LASTEXITCODE
+    if ($scheduleCode -eq 5) {
+        # Company policy denied Task Scheduler for standard users. Not fatal:
+        # docs\respaldo-hook-inicio.md describes the Claude Code startup hook.
+        Write-Warning "The scheduled task could not be created (access denied by policy). See docs\respaldo-hook-inicio.md for the startup-hook fallback."
+    } elseif ($scheduleCode -ne 0) {
+        throw "fetch.py schedule install failed with exit code $scheduleCode"
+    }
+}
+
 $PythonCommand = if ($Python.Prefix.Count -gt 0) { "$($Python.Exe) $($Python.Prefix -join ' ')" } else { $Python.Exe }
 Write-Host "`nInstallation complete." -ForegroundColor Green
 Write-Host "For the first Microsoft login, run:"
-Write-Host "  $PythonCommand `"$Fetch`" fix"
+if ($ProfileName) {
+    Write-Host "  $PythonCommand `"$Fetch`" fix --profile $ProfileName"
+} else {
+    Write-Host "  $PythonCommand `"$Fetch`" fix"
+}
