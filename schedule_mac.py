@@ -116,7 +116,10 @@ def build_plist(
 
 
 def gui_domain() -> str:
-    return f"gui/{os.getuid()}"
+    # os.getuid does not exist on Windows; this module is only exercised
+    # there by tests that patch the platform seam.
+    getuid = getattr(os, "getuid", None)
+    return f"gui/{getuid() if getuid else 0}"
 
 
 def run_launchctl(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
