@@ -64,9 +64,15 @@ def make_message(
     body: str = "Texto con acentos: información 😊",
     has_attachments: bool = False,
     conversation: str = "conv-1",
+    immutable_id: str | None = None,
+    internet_id: str | None = None,
 ) -> dict[str, Any]:
+    """`id` is the REST id (changes when the message moves); `_immutable` is
+    what Graph returns with Prefer IdType="ImmutableId" (stable)."""
     return {
         "id": message_id,
+        "_immutable": immutable_id or message_id,
+        "internetMessageId": internet_id or f"<{message_id}@example.invalid>",
         "conversationId": conversation,
         "parentFolderId": folder,
         "subject": subject,
@@ -191,6 +197,10 @@ class FakeGraphHandler(BaseHTTPRequestHandler):
             if raw_path == prefix:
                 self._error(status, "Forbidden" if status == 403 else "ServiceUnavailable")
                 return
+        if raw_path in server.raw_responses:
+            status, body = server.raw_responses[raw_path]
+            self._send(status, body.encode("utf-8"), "application/json; charset=utf-8")
+            return
 
         if server.unauthorized_once and not server.did_unauthorized and raw_path in server.unauthorized_paths:
             server.did_unauthorized = True
@@ -255,12 +265,32 @@ class FakeGraphHandler(BaseHTTPRequestHandler):
             return
         self._error(404, "ErrorItemNotFound")
 
+    def _immutable(self) -> bool:
+        return 'IdType="ImmutableId"' in (self.headers.get("Prefer") or "")
+
+    def _present(self, message: dict[str, Any]) -> dict[str, Any]:
+        shown = {k: v for k, v in message.items() if not k.startswith("_")}
+        if self._immutable():
+            shown["id"] = message.get("_immutable", message["id"])
+        return shown
+
+    def _find(self, message_id: str) -> dict[str, Any] | None:
+        key = "_immutable" if self._immutable() else "id"
+        return next((m for m in self.server.messages if m.get(key, m["id"]) == message_id), None)
+
     def _messages(self, rest: list[str], query: dict[str, list[str]]):
         server = self.server
         if rest:
             message_id = rest[0]
             if len(rest) >= 2 and rest[1] == "attachments":
-                self._json({"value": server.attachments.get(message_id, [])})
+                found = self._find(message_id)
+                keys = [message_id] + ([found["id"], found.get("_immutable")] if found else [])
+                value = next((server.attachments[k] for k in keys if k in server.attachments), [])
+                self._json({"value": value})
+                return
+            found = self._find(message_id)
+            if len(rest) == 1 and found is not None:
+                self._json(self._present(found))
                 return
             self._error(404, "ErrorItemNotFound")
             return
@@ -277,7 +307,7 @@ class FakeGraphHandler(BaseHTTPRequestHandler):
         )
         top = int((query.get("$top") or ["50"])[0])
         skip = int((query.get("$skip") or ["0"])[0])
-        page = items[skip: skip + top]
+        page = [self._present(m) for m in items[skip: skip + top]]
         payload: dict[str, Any] = {"value": page}
         if skip + top < len(items):
             params = {k: v[0] for k, v in query.items()}
@@ -350,6 +380,11 @@ class FakeGraphHandler(BaseHTTPRequestHandler):
 class FakeGraphServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        # A client that timed out closes the socket while a delayed handler is
+        # still writing (BrokenPipe/ConnectionReset): expected in timeout tests.
+        return
+
     def __init__(self, port: int = 0):
         super().__init__(("127.0.0.1", port), FakeGraphHandler)
         self.base_url = f"http://127.0.0.1:{self.server_port}"
@@ -379,6 +414,7 @@ class FakeGraphServer(ThreadingHTTPServer):
         self.delays: dict[str, float] = {}
         self.on_request = None  # optional callable(path) for tests
         self.fail_paths: dict[str, int] = {}  # exact path -> HTTP status
+        self.raw_responses: dict[str, tuple[int, str]] = {}  # exact path -> (status, raw body)
 
     @staticmethod
     def mail_message(message_id: str, subject: str):
