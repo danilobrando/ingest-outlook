@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [string]$VaultRoot,
@@ -122,6 +122,10 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[ok] $PythonVersion"
 
 $ResolvedVault = New-DirectoryLiteral $VaultRoot
+# "C:\vault\" would reach Python as C:\vault" (a trailing backslash escapes
+# the closing quote on the Windows command line). Keep drive roots (C:\) intact.
+$VaultArg = $ResolvedVault
+if ($VaultArg.Length -gt 3) { $VaultArg = $VaultArg.TrimEnd([char]'\') }
 $TargetDir = Join-Literal $ResolvedVault ".claude\skills\ingest-outlook"
 $SourceDir = [System.IO.Path]::GetFullPath($PSScriptRoot)
 
@@ -156,7 +160,7 @@ if (-not (Test-Path -LiteralPath $Fetch)) {
 }
 $ConfigureArgs = @($Fetch)
 if ($ProfileName) { $ConfigureArgs += @("--profile", $ProfileName) }
-$ConfigureArgs += @("configure", "--vault-root", $ResolvedVault)
+$ConfigureArgs += @("configure", "--vault-root", $VaultArg)
 if ($ClientId) { $ConfigureArgs += @("--client-id", $ClientId) }
 if ($TenantId) { $ConfigureArgs += @("--tenant-id", $TenantId) }
 if ($ReadOnly) { $ConfigureArgs += "--read-only" }
@@ -177,15 +181,16 @@ if ($LASTEXITCODE -ne 0) { throw "fetch.py version failed with exit code $LASTEX
 
 if ($Schedule) {
     Write-Step "Scheduling the automatic sync (one task per vault: sync --all)"
-    $runScheduleArgs = @($Python.Prefix) + @($Fetch, "schedule", "install", "--vault-root", $ResolvedVault)
+    $runScheduleArgs = @($Python.Prefix) + @($Fetch, "schedule", "install", "--vault-root", $VaultArg)
     & $Python.Exe @runScheduleArgs
     $scheduleCode = $LASTEXITCODE
-    if ($scheduleCode -eq 5) {
-        # Company policy denied Task Scheduler for standard users. Not fatal:
-        # docs\respaldo-hook-inicio.md describes the Claude Code startup hook.
-        Write-Warning "The scheduled task could not be created (access denied by policy). See docs\respaldo-hook-inicio.md for the startup-hook fallback."
-    } elseif ($scheduleCode -ne 0) {
-        throw "fetch.py schedule install failed with exit code $scheduleCode"
+    if ($scheduleCode -ne 0) {
+        # Never fatal: the connector is installed; only the automatic run is
+        # missing, and docs\respaldo-hook-inicio.md covers that case.
+        $Respaldo = Join-Literal $TargetDir "docs\respaldo-hook-inicio.md"
+        Write-Warning ("No se pudo programar la ingesta automática (código $scheduleCode). " +
+            "El conector quedó instalado, pero la ingesta no correrá sola cada 30 minutos. " +
+            "Respaldo: dispararla desde el hook de inicio de Claude Code, como explica $Respaldo")
     }
 }
 
