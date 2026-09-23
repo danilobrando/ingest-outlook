@@ -11,6 +11,7 @@ A Claude Code skill that connects Microsoft 365 (Outlook mail, calendar, Teams m
 - **Audit**: every write action logged to `~/.config/ingest-outlook/audit.jsonl`
 - **Stdlib only**: Python 3.10+, no `pip install` required
 - **Corporate-safe profile**: read-only mode requests only mail/calendar read permissions by default and blocks every write command locally
+- **Cerebro layout (v0.6)**: one vault per person reading 1..N Microsoft 365 tenants (one profile each), synced automatically every 30 minutes by a Windows task or a macOS LaunchAgent, under one lock per vault
 
 ## Quick start
 
@@ -56,7 +57,7 @@ That's it. The skill is now loaded into your Claude Code agent, and you can inte
 For a managed corporate account, the recommended setup is the read-only profile. Open PowerShell and run these commands, replacing `<cargo>`, `<client-id>` and `<tenant-id>` with the values for your vault and tenant:
 
 ```powershell
-git clone --branch v0.5.1 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
+git clone --branch v0.6.0 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
 py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py" fix
 ```
@@ -64,6 +65,46 @@ py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py"
 The third command completes the first browser login.
 
 If `py -3` is unavailable, use `python`, provided it resolves to Python 3.10+ and not a `WindowsApps` Microsoft Store stub. The Application (client) ID and Directory (tenant) ID are public identifiers, not passwords or secrets; the company's IT administrator creates the app in the company's own tenant and gives users those two IDs. See the [Spanish Windows installation guide](docs/instalacion-windows-es.md).
+
+## v0.6: cerebro layout (profiles, `sync`, `schedule`)
+
+The legacy layout above (`External Inputs/Outlook/...`, fed by `fetch.py | ingest.py`) is still the default. v0.6 adds a second layout, `cerebro`, for vaults that follow the System 3 canonical layout: raw inputs land under `raw/entradas/`, and a separate extraction process turns them into project notes.
+
+**Profiles.** One profile per Microsoft 365 tenant, as many as the person needs. `--profile <slug>` (before or after the subcommand, or `INGEST_OUTLOOK_PROFILE`) keeps config, token, logs, watermark and indices in `~/.config/ingest-outlook/<slug>/`. Nothing of this goes into the vault.
+
+```bash
+fetch.py configure --profile acme --empresa acme --layout cerebro \
+  --client-id <guid> --tenant-id <guid> --read-only [--teams] --vault-root ~/cerebros/<cargo>
+fetch.py fix --profile acme            # first sign-in (opens the browser)
+fetch.py sync --all --dry-run          # what would be written, writes nothing
+fetch.py sync --all                    # every cerebro profile of the vault, one lock
+fetch.py schedule install              # Windows task or macOS LaunchAgent
+```
+
+**What `sync` writes** (paths relative to the vault; every path is configurable per profile):
+
+| Source | Path | Rule |
+|---|---|---|
+| Mail (whole mailbox minus junk, deleted items, drafts) | `raw/entradas/correo/<empresa>/YYYY-MM-DD/HHMM-<subject-slug>.md` | One file per message, immutable, full text body up to 100 KB, attachment names only |
+| Calendar (yesterday to +14 days) | `raw/entradas/calendario/<empresa>/YYYY-MM-DD.md` | One file per day, rewritten when it changes; cancelled and deleted events are reflected |
+| Teams transcripts (`teams: true`) | `raw/entradas/reuniones/<empresa>/YYYY-MM-DD-<slug>.md` + `.vtt` | Immutable; `[HH:MM:SS] Name: text` per intervention |
+| Run log | `.claude/system3/logs/ingesta.log` | One line per profile and run, no personal data |
+| Vault lock | `.claude/system3/cerebro.lock` | Shared with the extraction and the s3 index (`cerebro_lock.py`) |
+
+Frontmatter keys are Spanish and fixed by the shared contract: `fuente, empresa, cuenta, fecha, id_origen, participantes, asunto, proyecto` (+ `carpeta, hilo, adjuntos, ingestado` for mail; `organizador, vtt` for meetings). `empresa` is mandatory and always equals the `<empresa>` folder. `participantes` are normalized to `Name <email>` (lowercase email, deduplicated, sender or organizer first, meeting rooms moved to `lugar`).
+
+**Configuration keys** (`configure --show --profile <slug>` prints each value with its source): `layout` (`legacy` | `cerebro`), `empresa`, `raw_root` (`raw/entradas`), `lock_path` (`.claude/system3/cerebro.lock`), `ingest_log_path` (`.claude/system3/logs/ingesta.log`), `--registros-dir <dir>` (shortcut for both), `backfill_days` (30), `calendar_past_days` (1), `calendar_ahead_days` (14), `mail_exclude_folders` (`junkemail,deleteditems,drafts`), `max_messages_per_run` (1000).
+
+**Behavior worth knowing:**
+
+- The first run backfills `backfill_days` of mail; after that it is incremental by `receivedDateTime` watermark. A run stops cleanly after 8 minutes or `max_messages_per_run` messages and the next run continues.
+- One lock per vault: created with O_EXCL; abandoned after 20 minutes and stolen; if busy, `sync` waits up to 5 minutes and then skips the run (exit 0, `estado saltada`). `sync` refuses to run if the profiles of a vault, or the vault's `.claude/system3/config.json`, disagree on `lock_path`.
+- `sync` never opens a browser. When a refresh token stops working it writes `needs-login` in the profile, logs `requiere-login`, and exits **4**; a person runs `fix --profile <slug>` to sign in again.
+- Exit codes: 0 ok or skipped, 1 error, 2 configuration, 4 needs sign-in (`sync --all` returns the worst).
+- Teams: a `403 GraphAccessToTranscriptsDisabled` is logged with that code and does not stop mail or calendar. See [`docs/teams-transcripts-research.md`](docs/teams-transcripts-research.md).
+- `schedule` on Windows registers `\Rewired\Cerebro - ingesta` for the current user (only while signed in, no elevation, Mon-Fri 07:00-19:00 every 30 minutes, `pythonw.exe`); if company policy denies it, see [`docs/respaldo-hook-inicio.md`](docs/respaldo-hook-inicio.md). On macOS it installs `~/Library/LaunchAgents/com.cerebro.ingesta.<hash>.plist` (every 30 minutes). Elsewhere it prints a message.
+
+Guides (Spanish): [installation](docs/instalacion-cerebro-es.md), [app registration for the IT admin](docs/ti-registro-app-es.md), [startup-hook fallback](docs/respaldo-hook-inicio.md).
 
 ## What you can ask your Claude Code agent
 
@@ -99,9 +140,12 @@ your message ──► Claude Code agent
                                               └── prints next steps for the rest
 ```
 
-Two scripts:
-- **`fetch.py`** — talks to Microsoft Graph (OAuth2 + REST). 10 subcommands. Stdlib only.
-- **`ingest.py`** — normalizes Graph JSON responses into vault markdown. Stdlib only.
+Scripts (all stdlib only):
+- **`fetch.py`** — the single CLI entry point: OAuth2 + Microsoft Graph REST, profiles, `sync`, `schedule`, `doctor`/`fix`.
+- **`ingest.py`** — normalizes Graph JSON responses into legacy-layout vault markdown.
+- **`sync_cerebro.py`** — writes the cerebro raw layer (used by `fetch.py sync`).
+- **`cerebro_lock.py`** — the vault lock, importable and with its own CLI for the other cerebro processes.
+- **`schedule_win.py`**, **`schedule_mac.py`** — Windows Task Scheduler and macOS LaunchAgent support.
 
 Single contract file:
 - **`SKILL.md`** — read by Claude Code at session start. Defines trigger phrases, auto-recovery policy, and how the agent should react to user-reported problems.
@@ -120,10 +164,12 @@ fetch.py event-delete --event-id <id> --yes
 fetch.py doctor [--vault-root <path>]                      # read-only diagnostic
 fetch.py fix [--vault-root <path>] [--quiet]               # diagnose + auto-repair
 fetch.py configure [options] [--show]                       # persistent cross-platform config
+fetch.py sync [--all | --profile <slug>] [--vault-root <path>] [--dry-run] [--only mail|calendar|meetings]
+fetch.py schedule install|remove|status [--vault-root <path>] [--every 30] [--start 07:00] [--hours 12] [--dry-run]
 fetch.py version
 ```
 
-All commands accept `--verbose` for debug output to stderr.
+All commands accept `--verbose` for debug output to stderr and `--profile <slug>` to select a profile.
 
 `calendar` uses local-day boundaries: `--days 1 --ahead 1` requests today from 00:00 through tomorrow at 23:59:59, then sends the corresponding UTC range to Microsoft Graph. `--ahead` defaults to `0`.
 
@@ -179,7 +225,7 @@ Add this to your `~/.claude/settings.json` so `fix --quiet` runs at every Claude
 - **Local-only**: all data and tokens stay on your machine. No third-party servers.
 - **Token storage**: `~/.config/ingest-outlook/token.json`, protected by mode `0o600` on POSIX and the user-profile ACL on Windows.
 - **Audit log**: every write action (send-mail, event-create/update/delete) recorded with timestamp, recipients, subject, body hash (not body content) to `~/.config/ingest-outlook/audit.jsonl`.
-- **Read PII safeguards**: ingested mail bodies are truncated to 500 chars in the vault. Calendar bodies to 400 chars. Transcripts are stored verbatim (the whole point).
+- **Read PII safeguards**: in the legacy layout, ingested mail bodies are truncated to 500 chars in the vault. Calendar bodies to 400 chars. Transcripts are stored verbatim (the whole point). The cerebro layout stores the full plain-text mail body (100 KB cap), because the downstream extraction needs it.
 - **Sensitive paths warning**: do not let `~/.config/` be synced by cloud providers (iCloud, OneDrive, MDM profiles). The connector's `fix` command detects most cases.
 
 ## Required Microsoft Graph permissions
