@@ -33,3 +33,10 @@ token.json
 log.jsonl
 audit.jsonl
 refresh.lock
+state.json
+ids-correo.txt
+ids-reuniones.txt
+needs-login
+cuenta.json
+cerebro.lock
+.cerebro.lock

@@ -1,6 +1,6 @@
 ---
 name: ingest-outlook
-description: Outlook/Microsoft 365 connector for Windows, macOS, and Linux, with a recommended corporate read-only profile plus optional read-write capabilities AND autonomous self-healing. Subcommands - configure, mail/calendar/meetings/list-calendars (read), send-mail/event-create/event-update/event-delete (write profile only), doctor/fix (recovery), version. **AUTO-RECOVERY TRIGGER: when the user reports ANY issue related to Outlook, Microsoft 365, correo, mail, email, calendario, calendar, reuniones, meetings, or Teams — including vague phrases like "no funciona", "no me llegan correos", "está raro", "no veo mis reuniones", "no puedo enviar", "error con el mail", "algo no anda con mi outlook" — this skill MUST be invoked FIRST and the orchestrator MUST silently run `fetch.py fix --vault-root <user-vault>` BEFORE responding to the user. The agent parses the fix output and either confirms the auto-repair OR walks the user through the manual steps conversationally.** Read subcommands write to the configured Outlook output directory, idempotent per day. In read-only mode, write subcommands are unavailable and the agent must never offer them.
+description: Outlook/Microsoft 365 connector for Windows, macOS, and Linux, with a recommended corporate read-only profile plus optional read-write capabilities AND autonomous self-healing. Subcommands - configure, mail/calendar/meetings/list-calendars (read), sync (non-interactive ingestion into the cerebro layout, one profile per Microsoft 365 tenant via --profile), schedule (automatic sync: Windows task or macOS LaunchAgent), send-mail/event-create/event-update/event-delete (write profile only), doctor/fix (recovery), version. **sync exit code 4 means a person must sign in again: ask the user to run `fix --profile <perfil>` (it opens the browser); automations must never open a browser.** **AUTO-RECOVERY TRIGGER: when the user reports ANY issue related to Outlook, Microsoft 365, correo, mail, email, calendario, calendar, reuniones, meetings, or Teams — including vague phrases like "no funciona", "no me llegan correos", "está raro", "no veo mis reuniones", "no puedo enviar", "error con el mail", "algo no anda con mi outlook" — this skill MUST be invoked FIRST and the orchestrator MUST silently run `fetch.py fix --vault-root <user-vault>` BEFORE responding to the user. The agent parses the fix output and either confirms the auto-repair OR walks the user through the manual steps conversationally.** Read subcommands write to the configured Outlook output directory, idempotent per day. In read-only mode, write subcommands are unavailable and the agent must never offer them.
 ---
 
 # ingest-outlook, Outlook + Microsoft 365 connector
@@ -130,6 +130,8 @@ Do NOT use for:
 | `event-create` | **Write** | `Calendars.ReadWrite` | Event id + subject on stdout |
 | `event-update` | **Write** | `Calendars.ReadWrite` | Updated event id + changed fields on stdout |
 | `event-delete` | **Write** | `Calendars.ReadWrite` | Confirmation line on stdout, requires `--yes` |
+| `sync` | Read | `Mail.Read`, `Calendars.Read` (+ Teams scopes with `teams`) | Cerebro raw files under `raw/entradas/...` + one ingest-log line per profile; exit 4 = needs sign-in |
+| `schedule` | Local only | none | Windows task / macOS LaunchAgent that runs `sync --all` |
 
 ### Read-only profile contract
 
@@ -140,6 +142,25 @@ In the read-only profile without `shared_calendars`, `list-calendars` and `calen
 `meetings` exists only when an administrator enabled Teams for this connector (`teams: true`, which needs admin consent). In the read-only profile without Teams, do not offer or attempt `meetings`.
 
 Exit code 3 means the organization read-only policy blocked the command before any Microsoft call. It is not a connector error, a bad login, or something `fix` can repair. Explain that to the user as a company policy: the action is not allowed here. Do not describe it as a failure or a bug.
+
+## Cerebro layout: profiles, `sync` and `schedule` (v0.6)
+
+A "cerebro" is one vault per person that reads one or more Microsoft 365 accounts, one **profile** per company tenant. Profiles are generic slugs chosen at install time (`--profile <slug>`), never hardcoded; a vault can have 1..N of them.
+
+- **Profile state** lives outside the vault in `<config-dir>/<slug>/` (config, token, logs, `state.json` watermark, `ids-correo.txt` / `ids-reuniones.txt` indices, `needs-login` marker). Select it with `--profile <slug>` before or after the subcommand, or `INGEST_OUTLOOK_PROFILE`.
+- **Setup**: `configure --profile <slug> --empresa <slug> --layout cerebro --client-id <guid> --tenant-id <guid> --read-only [--teams] --vault-root "<vault>"`. `--empresa` is mandatory for the cerebro layout: it is written in every raw file and names the `<empresa>` folder.
+- **Raw files** (vault-relative, configurable with `--raw-root`, default `raw/entradas`):
+  - `raw/entradas/correo/<empresa>/YYYY-MM-DD/HHMM-<subject-slug>.md`, one per message, immutable, full plain-text body (100 KB cap), attachment names only;
+  - `raw/entradas/calendario/<empresa>/YYYY-MM-DD.md`, one per day from yesterday to +14 days, rewritten each run (only when something changed);
+  - `raw/entradas/reuniones/<empresa>/YYYY-MM-DD-<meeting-slug>.md` plus the original `.vtt`, immutable, one line per intervention `[HH:MM:SS] Nombre: texto` (only with `teams`).
+  Frontmatter keys are Spanish (`fuente, empresa, cuenta, fecha, id_origen, participantes, asunto, proyecto`, plus `id_internet, carpeta, hilo, adjuntos, ingestado` for mail, and `adjuntos_error: true` when the attachment list could not be read). `participantes` items are `Nombre <correo>` (or `<correo>`), lowercase emails, deduplicated, sender or organizer first, rooms excluded. The connector never writes the `sintetico` key.
+- **`sync`** (`sync --all` for every cerebro profile of the vault, or `sync --profile <slug>`; `--dry-run` writes nothing; `--only mail|calendar|meetings`) takes the single vault lock (`.claude/system3/cerebro.lock` by default), processes profiles alphabetically under one lock, stops cleanly after 8 minutes (the next run continues from the watermark), and appends one line per profile to `.claude/system3/logs/ingesta.log`: `ISO | perfil | correo N nuevos | calendario D días | reuniones M | estado ok|saltada|requiere-login|error: motivo`.
+- **Exit codes of `sync`**: 0 ok or skipped (lock busy), 1 error, 2 configuration problem, **4 needs sign-in**. With `--all` the worst code wins; one profile failing never stops the others.
+- **Exit 4 / `requiere-login`**: the refresh token no longer works. `sync` never opens a browser (it runs from a scheduled task or a hook with nobody watching). Tell the user, in plain words, that their session with that company expired and ask them to sign in; with their OK run `<python> "<skill-base>/fetch.py" fix --profile <perfil>` (this is the one step that opens the browser). `fix` clears the `needs-login` marker. Do not retry `sync` in a loop and do not try to open the browser from any automation.
+- **What `sync` tolerates**: a failing source is logged and the others still run (mail first, then calendar, then meetings); a message whose attachments cannot be listed is written with `adjuntos_error: true`; a message that cannot be written three runs in a row is listed in `<config-dir>/<slug>/skipped.txt`. Transcripts are looked for `meetings_lookback_days` back (7 by default). A `401` on a single meeting is logged as `sin acceso: 401`; only when `/me` also fails does the run end in `requiere-login`.
+- **Teams**: a `403 GraphAccessToTranscriptsDisabled` in the log means the tenant switch "Microsoft Graph access" (Teams admin center) is off. It is an IT setting, not a connector bug; mail and calendar keep working. Without "Include speaker attribution", speakers show as `Desconocido`.
+- **`schedule install|remove|status`**: Windows registers `\Rewired\Cerebro - ingesta` (current user, only while signed in, no elevation, Mon-Fri 07:00-19:00 every 30 min, `pythonw.exe fetch.py sync --all`). If policy denies it (exit 5), the fallback is the Claude Code startup hook in `docs/respaldo-hook-inicio.md`. macOS installs a per-user LaunchAgent `com.cerebro.ingesta.<hash>` (every 30 min). Other systems: message only.
+- **Lock**: one lock per vault shared with the extraction and the s3 index (`cerebro_lock.py acquire|release|status`; `release` needs the `--pid` and `--inicio` that `acquire` printed). `sync` refuses to run if profiles of the same vault, or the vault's `.claude/system3/config.json`, disagree on `lock_path`.
 
 ## Personal vs corporate Microsoft accounts
 
@@ -162,7 +183,7 @@ Operator obligations:
 1. **Treat the output files as confidential.** Never commit them to a public repository. Never paste them into a public chat. Never share them outside the vault owner.
 2. **Never ingest a shared mailbox you do not own.** Delegated mailboxes, shared inboxes, and "On behalf of" access scenarios require the inbox owner's explicit consent.
 3. **Scrub before sharing.** If a file ever needs to leave the vault, scrub names, addresses, phone numbers, account numbers, and message bodies first.
-4. **Mail bodies are truncated to 500 chars** as a volume cap, not a redaction. Calendar bodies are truncated to 400 chars. **Transcripts are stored verbatim** because truncating defeats the purpose of capturing meeting content. Treat transcripts as the most sensitive output of this skill.
+4. **Mail bodies are truncated to 500 chars** in the legacy layout as a volume cap, not a redaction. The cerebro layout (`sync`) stores the **full plain-text body up to 100 KB** per message, because the extraction needs it; treat those files as confidential. Calendar bodies are truncated to 400 chars. **Transcripts are stored verbatim** because truncating defeats the purpose of capturing meeting content. Treat transcripts as the most sensitive output of this skill.
 5. **Tokens stay local.** OAuth tokens live in the configured state directory (default `~/.config/ingest-outlook/token.json`). POSIX uses mode 0600; Windows relies on the user-profile ACL. Do not commit, copy, or share that file.
 
 If any of these obligations is unclear, do not run the skill. Ask first.
@@ -201,10 +222,12 @@ The first run will open the browser to complete OAuth authorization. Subsequent 
 
 ## How it works
 
-The skill is a thin orchestrator. Two Python scripts do the work:
+The skill is a thin orchestrator. Two Python scripts do the work in the legacy layout:
 
 - `<skill-base>/fetch.py` runs OAuth2 + Microsoft Graph queries, emits JSON to stdout
 - `<skill-base>/ingest.py` reads the JSON, writes the vault file
+
+The cerebro layout needs no pipe: `fetch.py sync` writes the raw files itself (see "Cerebro layout" above).
 
 The subcommand is the first positional arg to `fetch.py`:
 
@@ -422,7 +445,7 @@ If the user loses their laptop, suspects a token compromise, or wants to revoke 
 
 This skill is a single directory under `~/.claude/skills/ingest-outlook/`. To port to another machine:
 
-1. Copy the folder (4 files: `SKILL.md`, `fetch.py`, `ingest.py`, `.env.example`).
+1. Copy the folder (`SKILL.md`, `fetch.py`, `ingest.py`, `sync_cerebro.py`, `cerebro_lock.py`, `schedule_win.py`, `schedule_mac.py`, `.env.example`; `docs/` is optional).
 2. Ensure Python 3.10+ is installed. No pip dependencies.
 3. Copy `.env.example` to `~/.zshrc` or a sourced shell file, fill in the values.
 4. Run any subcommand once to trigger the OAuth flow; the token cache is created automatically.

@@ -10,6 +10,15 @@ Subcommands:
   mail      Outlook messages from a folder or free-text search query
   calendar  Calendar events from /me/calendarView
   meetings  Teams online meetings + transcripts (corporate accounts only)
+  sync      Non-interactive ingestion into the "cerebro" layout (v0.6):
+            whole mailbox, calendar day files and Teams transcripts, under
+            the single vault lock (cerebro_lock.py). Never opens a browser.
+  schedule  Automatic sync: Windows Task Scheduler task
+            "\\Rewired\\Cerebro - ingesta"; macOS per-user LaunchAgent
+
+Profiles (v0.6): `--profile <slug>` (or INGEST_OUTLOOK_PROFILE) keeps config,
+token, logs, state and indices in <config-dir>/<slug>/, one per Microsoft 365
+tenant (for example acme and globex).
 
 Auth:
   OAuth 2.0 authorization-code flow with PKCE (RFC 7636), loopback redirect
@@ -37,17 +46,19 @@ Stdlib only. No external dependencies.
 from __future__ import annotations
 
 __author__ = "Danny Bravo"
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 __license__ = "MIT"
 
 import argparse
 import base64
 import hashlib
+import http.client
 import http.server
 import json
 import os
 import re
 import secrets
+import socket
 import socketserver
 import sys
 import threading
@@ -59,6 +70,17 @@ import webbrowser
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
+
+# Sibling modules (cerebro_lock, sync_cerebro, schedule_win) live next to this
+# file; make them importable however fetch.py was started or loaded.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import cerebro_lock  # noqa: E402
+import schedule_mac  # noqa: E402
+import schedule_win  # noqa: E402
+import sync_cerebro  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants and config
@@ -110,21 +132,53 @@ OPTIONAL_SCOPES = frozenset({
 })
 GRAPH_SCOPE_PREFIX = "https://graph.microsoft.com/"
 
-TOKEN_DIR = Path(
+BASE_CONFIG_DIR = Path(
     os.environ.get(
         "INGEST_OUTLOOK_CONFIG_DIR",
         str(Path.home() / ".config" / "ingest-outlook"),
     )
 ).expanduser()
+TOKEN_DIR = BASE_CONFIG_DIR
 CONFIG_PATH = TOKEN_DIR / "config.json"
 TOKEN_PATH = TOKEN_DIR / "token.json"
 LOG_PATH = TOKEN_DIR / "log.jsonl"
 AUDIT_PATH = TOKEN_DIR / "audit.jsonl"
 LOCK_PATH = TOKEN_DIR / "refresh.lock"
+NEEDS_LOGIN_PATH = TOKEN_DIR / "needs-login"
+
+PROFILE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+_active_profile: str | None = None
+
+# v0.6 "cerebro" layout (System 3 canonical vault, contract section 0).
+LAYOUTS = ("legacy", "cerebro")
+DEFAULT_RAW_ROOT = "raw/entradas"
+DEFAULT_LOCK_REL = cerebro_lock.DEFAULT_LOCK_PATH          # .claude/system3/cerebro.lock
+DEFAULT_INGEST_LOG = ".claude/system3/logs/ingesta.log"
+SYSTEM3_CONFIG_REL = ".claude/system3/config.json"
+DEFAULT_EXCLUDED_FOLDERS = ["junkemail", "deleteditems", "drafts"]
+SYNC_BUDGET_SECONDS = 8 * 60
+EXIT_NEEDS_LOGIN = 4
 
 MESSAGE_LIMIT = 50            # max items per Graph page
 MAX_PAGES = 4                 # cap on pagination (default 200 items max per fetch)
-HTTP_TIMEOUT = 30
+def _env_timeout(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+HTTP_TIMEOUT = _env_timeout("INGEST_OUTLOOK_HTTP_TIMEOUT", 30)
+# Transient transport failures retried like URLError. socket.timeout is
+# TimeoutError on 3.10+, but the name keeps older semantics explicit.
+NETWORK_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+    http.client.HTTPException,
+)
 MAX_RETRIES = 3
 TIME_SKEW_WARN_SECONDS = 60
 TOKEN_FRESHNESS_BUFFER = 300  # require >5 min remaining; force prophylactic refresh otherwise
@@ -137,6 +191,9 @@ _run_started_at: float | None = None  # set in main()
 _active_cfg: "Config | None" = None   # set by get_access_token; used by mid-run 401 retry
 _verbose_mode = False                 # set by --verbose flag
 _quiet_mode = False                   # set by --quiet flag
+_non_interactive = False              # set by sync: never open a browser
+_current_access_token: str | None = None  # latest token (mid-run refreshes)
+_run_started_monotonic: float | None = None
 
 GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -153,6 +210,11 @@ WINDOWS_RESERVED_NAMES = {
 def _is_windows() -> bool:
     """Single seam for platform checks (tests patch this, not os.name)."""
     return os.name == "nt"
+
+
+def _is_macos() -> bool:
+    """Seam for the macOS LaunchAgent path of `schedule` (tests patch this)."""
+    return sys.platform == "darwin"
 
 
 def _configure_console_encoding() -> None:
@@ -177,10 +239,45 @@ def _chmod_private(path: Path, mode: int) -> None:
 def _ensure_config_dir() -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     _chmod_private(TOKEN_DIR, 0o700)
+    if TOKEN_DIR != BASE_CONFIG_DIR:
+        _chmod_private(BASE_CONFIG_DIR, 0o700)
+
+
+def validate_profile(value: str) -> str:
+    slug = str(value or "").strip()
+    if not PROFILE_RE.fullmatch(slug) or slug in WINDOWS_RESERVED_NAMES:
+        raise ValueError("profile must be a slug [a-z0-9-]{1,32} (for example acme)")
+    return slug
+
+
+def validate_empresa(value: str) -> str:
+    return sync_cerebro.validate_empresa(value)
+
+
+def _profile_dir(profile: str | None) -> Path:
+    return BASE_CONFIG_DIR / profile if profile else BASE_CONFIG_DIR
+
+
+def _select_profile(profile: str | None) -> None:
+    """Point every per-profile path (config, token, logs, state, sentinel,
+    refresh lock) at <base>/<profile>/, or at <base>/ without a profile."""
+    global _active_profile, TOKEN_DIR, CONFIG_PATH, TOKEN_PATH, LOG_PATH
+    global AUDIT_PATH, LOCK_PATH, NEEDS_LOGIN_PATH
+    _active_profile = validate_profile(profile) if profile else None
+    TOKEN_DIR = _profile_dir(_active_profile)
+    CONFIG_PATH = TOKEN_DIR / "config.json"
+    TOKEN_PATH = TOKEN_DIR / "token.json"
+    LOG_PATH = TOKEN_DIR / "log.jsonl"
+    AUDIT_PATH = TOKEN_DIR / "audit.jsonl"
+    LOCK_PATH = TOKEN_DIR / "refresh.lock"
+    NEEDS_LOGIN_PATH = TOKEN_DIR / "needs-login"
 
 
 def _command_hint(command: str = "fix") -> str:
-    return f'"{sys.executable}" "{Path(__file__).resolve()}" {command}'
+    hint = f'"{sys.executable}" "{Path(__file__).resolve()}" {command}'
+    if _active_profile:
+        hint += f" --profile {_active_profile}"
+    return hint
 
 
 def _verbose(msg: str) -> None:
@@ -203,11 +300,11 @@ AADSTS_HANDLERS: dict[str, tuple[str, str]] = {
     ),
     "AADSTS50173": (
         "Fresh authentication required (token too old, policy reset, or password changed).",
-        f"Delete the token cache at {TOKEN_PATH} and re-authenticate with: {_command_hint('fix')}",
+        "Delete the token cache at {token_path} and re-authenticate with: {fix_cmd}",
     ),
     "AADSTS70008": (
         "Refresh token expired or revoked (90-day max for personal, tenant policy for corporate).",
-        f"Delete the token cache at {TOKEN_PATH} and re-authenticate with: {_command_hint('fix')}",
+        "Delete the token cache at {token_path} and re-authenticate with: {fix_cmd}",
     ),
     "AADSTS65001": (
         "User or admin has not consented to one or more requested scopes.",
@@ -268,8 +365,11 @@ def explain_aadsts(error_body: str, redirect_uri: str | None = None) -> str | No
         if code in error_body:
             # AADSTS500113 contains the substring AADSTS50011; the catalogue
             # lists 500113 first so the longer code wins.
-            if "{redirect_uri}" in fix:
-                fix = fix.format(redirect_uri=uri)
+            fix = (
+                fix.replace("{redirect_uri}", uri)
+                .replace("{token_path}", str(TOKEN_PATH))
+                .replace("{fix_cmd}", _command_hint("fix"))
+            )
             return f"\n  Error code:  {code}\n  Meaning:     {desc}\n  Next action: {fix}"
     return None
 
@@ -374,7 +474,31 @@ class Config:
         graph_base: str = DEFAULT_GRAPH_BASE,
         authority_base: str = DEFAULT_AUTHORITY_BASE,
         sources: dict[str, str] | None = None,
+        layout: str = "legacy",
+        empresa: str | None = None,
+        raw_root: str = DEFAULT_RAW_ROOT,
+        lock_path: str = DEFAULT_LOCK_REL,
+        ingest_log_path: str = DEFAULT_INGEST_LOG,
+        backfill_days: int = 30,
+        calendar_past_days: int = 1,
+        calendar_ahead_days: int = 14,
+        mail_exclude_folders: list[str] | None = None,
+        max_messages_per_run: int = 1000,
+        profile: str | None = None,
+        meetings_lookback_days: int = 7,
     ):
+        self.meetings_lookback_days = meetings_lookback_days
+        self.layout = layout
+        self.empresa = empresa
+        self.raw_root = raw_root
+        self.lock_path = lock_path
+        self.ingest_log_path = ingest_log_path
+        self.backfill_days = backfill_days
+        self.calendar_past_days = calendar_past_days
+        self.calendar_ahead_days = calendar_ahead_days
+        self.mail_exclude_folders = list(mail_exclude_folders or DEFAULT_EXCLUDED_FOLDERS)
+        self.max_messages_per_run = max_messages_per_run
+        self.profile = profile
         self.client_id = client_id
         self.tenant_id = tenant_id
         self.scopes = scopes
@@ -468,6 +592,30 @@ def validate_output_dir(value: str) -> str:
     return value.rstrip("/")
 
 
+def validate_vault_relative(value: str, label: str) -> str:
+    """Vault-relative path for raw_root / lock_path / ingest_log_path:
+    no absolute paths, no '..', no Windows reserved names; `.claude` is fine."""
+    return cerebro_lock.validate_relative_path(value, label)
+
+
+def _int_in_range(value: Any, label: str, low: int, high: int) -> int:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer from {low} to {high}") from exc
+    if not low <= number <= high:
+        raise ValueError(f"{label} must be an integer from {low} to {high}")
+    return number
+
+
+def _folder_list(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        items = str(value or "").split(",")
+    return [item.strip() for item in items if item.strip()]
+
+
 def _value_with_source(
     key: str,
     arg_value: Any,
@@ -525,6 +673,17 @@ def load_config(
         "vault_root": ("INGEST_OUTLOOK_VAULT_ROOT", None),
         "teams": (None, False),
         "shared_calendars": (None, False),
+        "layout": (None, "legacy"),
+        "empresa": (None, None),
+        "raw_root": (None, DEFAULT_RAW_ROOT),
+        "lock_path": (None, DEFAULT_LOCK_REL),
+        "ingest_log_path": (None, DEFAULT_INGEST_LOG),
+        "backfill_days": (None, 30),
+        "calendar_past_days": (None, 1),
+        "calendar_ahead_days": (None, 14),
+        "mail_exclude_folders": (None, list(DEFAULT_EXCLUDED_FOLDERS)),
+        "max_messages_per_run": (None, 1000),
+        "meetings_lookback_days": (None, 7),
     }
     values: dict[str, Any] = {}
     sources: dict[str, str] = {}
@@ -532,6 +691,21 @@ def load_config(
         values[key], sources[key] = _value_with_source(
             key, args.get(key), env_name, file_config, default
         )
+
+    layout = str(values["layout"] or "legacy").strip().lower()
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of: {', '.join(LAYOUTS)}")
+    empresa_raw = values["empresa"]
+    empresa = validate_empresa(empresa_raw) if empresa_raw not in (None, "") else None
+    raw_root = validate_vault_relative(str(values["raw_root"]), "raw_root")
+    lock_path = validate_vault_relative(str(values["lock_path"]), "lock_path")
+    ingest_log_path = validate_vault_relative(str(values["ingest_log_path"]), "ingest_log_path")
+    backfill_days = _int_in_range(values["backfill_days"], "backfill_days", 0, 3650)
+    calendar_past_days = _int_in_range(values["calendar_past_days"], "calendar_past_days", 0, 60)
+    calendar_ahead_days = _int_in_range(values["calendar_ahead_days"], "calendar_ahead_days", 0, 60)
+    max_messages = _int_in_range(values["max_messages_per_run"], "max_messages_per_run", 1, 100000)
+    meetings_lookback = _int_in_range(values["meetings_lookback_days"], "meetings_lookback_days", 1, 60)
+    exclude_folders = _folder_list(values["mail_exclude_folders"])
 
     client_id = str(values["client_id"] or "").strip()
     tenant_id = str(values["tenant_id"] or "common").strip()
@@ -599,6 +773,18 @@ def load_config(
         graph_base=graph_base,
         authority_base=authority_base,
         sources=sources,
+        layout=layout,
+        empresa=empresa,
+        raw_root=raw_root,
+        lock_path=lock_path,
+        ingest_log_path=ingest_log_path,
+        backfill_days=backfill_days,
+        calendar_past_days=calendar_past_days,
+        calendar_ahead_days=calendar_ahead_days,
+        mail_exclude_folders=exclude_folders,
+        max_messages_per_run=max_messages,
+        profile=_active_profile,
+        meetings_lookback_days=meetings_lookback,
     )
     GRAPH_BASE = cfg.graph_base
     AUTHORITY_BASE = cfg.authority_base
@@ -613,9 +799,10 @@ def _load_token() -> dict[str, Any] | None:
     if not TOKEN_PATH.is_file():
         return None
     try:
-        return json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(TOKEN_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def _save_token(token: dict[str, Any]) -> None:
@@ -625,8 +812,52 @@ def _save_token(token: dict[str, Any]) -> None:
     if scope_str:
         token["scopes_granted"] = scope_str.split()
     _ensure_config_dir()
-    TOKEN_PATH.write_text(json.dumps(token, indent=2), encoding="utf-8")
+    # Write-then-replace: a crash mid-write must not leave a truncated token.
+    tmp = TOKEN_PATH.with_name(f".token.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(token, indent=2), encoding="utf-8")
+    _chmod_private(tmp, 0o600)
+    for attempt in range(8):
+        try:
+            os.replace(tmp, TOKEN_PATH)
+            break
+        except PermissionError:
+            if attempt == 7:
+                raise
+            time.sleep(0.1 * (attempt + 1))
     _chmod_private(TOKEN_PATH, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# needs-login sentinel: written by `sync` when only a person can repair the
+# session; removed by `fix` after a successful sign-in.
+# ---------------------------------------------------------------------------
+
+def _write_needs_login(reason: str) -> None:
+    try:
+        _ensure_config_dir()
+        NEEDS_LOGIN_PATH.write_text(
+            json.dumps({"desde": _now_local_iso(), "motivo": reason, "perfil": _active_profile},
+                       ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _clear_needs_login() -> None:
+    try:
+        NEEDS_LOGIN_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _clear_cached_account() -> None:
+    try:
+        (TOKEN_DIR / sync_cerebro.ACCOUNT_FILE).unlink()
+    except OSError:
+        pass
 
 
 def _normalize_scope(scope: str) -> str:
@@ -790,6 +1021,9 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def _run_oauth_flow(config: Config) -> dict[str, Any]:
+    if _non_interactive:
+        # Defense in depth: automation (sync, scheduled task) never opens a browser.
+        raise sync_cerebro.NeedsLogin("se necesita iniciar sesión en el navegador")
     verifier, challenge = _generate_pkce()
     state = secrets.token_urlsafe(24)
 
@@ -889,6 +1123,7 @@ def _post_token(config: Config, data: bytes) -> dict[str, Any]:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        e.ingest_body = body  # type: ignore[attr-defined]  # read once; kept for callers
         explanation = explain_aadsts(body, redirect_uri=config.redirect_uri)
         print(f"ERROR: token endpoint returned HTTP {e.code}.", file=sys.stderr)
         if explanation:
@@ -915,11 +1150,12 @@ def get_access_token(config: Config, force_refresh: bool = False) -> str:
     Side effect: records `config` as the module-level active cfg so
     mid-run 401 retries can refresh without re-passing the cfg around.
     """
-    global _active_cfg
+    global _active_cfg, _current_access_token
     _active_cfg = config
 
     token = _load_token()
     if not force_refresh and token and _token_is_fresh(token):
+        _current_access_token = token["access_token"]
         return token["access_token"]
 
     got_lock = _acquire_refresh_lock()
@@ -930,6 +1166,7 @@ def get_access_token(config: Config, force_refresh: bool = False) -> str:
         token = _load_token()
         if token and _token_is_fresh(token):
             _verbose("another process refreshed while we waited; using fresh token")
+            _current_access_token = token["access_token"]
             return token["access_token"]
         _verbose("could not acquire refresh lock; proceeding anyway")
 
@@ -941,21 +1178,44 @@ def get_access_token(config: Config, force_refresh: bool = False) -> str:
                 if not refreshed.get("refresh_token"):
                     refreshed["refresh_token"] = token["refresh_token"]
                 _save_token(refreshed)
+                _current_access_token = refreshed["access_token"]
                 return refreshed["access_token"]
-            except urllib.error.HTTPError:
+            except urllib.error.HTTPError as e:
+                if _non_interactive:
+                    if e.code in (400, 401):
+                        raise sync_cerebro.NeedsLogin(_token_error_reason(e)) from None
+                    raise  # 5xx/429 from the token endpoint: transient, not a login problem
                 print(
                     "Cached refresh token rejected. Starting a fresh OAuth flow.",
                     file=sys.stderr,
                 )
                 _delete_token()
 
+        if _non_interactive:
+            raise sync_cerebro.NeedsLogin("no hay una sesión guardada")
         _verbose("running full OAuth authorization-code flow")
         token = _run_oauth_flow(config)
         _save_token(token)
+        _clear_needs_login()
+        _clear_cached_account()
+        _current_access_token = token["access_token"]
         return token["access_token"]
     finally:
         if got_lock:
             _release_refresh_lock()
+
+
+def _token_error_reason(error: urllib.error.HTTPError) -> str:
+    """Short, non-personal reason from a token-endpoint error body."""
+    body = getattr(error, "ingest_body", "") or ""
+    match = re.search(r"AADSTS\d+", body)
+    if match:
+        return match.group(0)
+    try:
+        code = json.loads(body).get("error")
+    except (ValueError, AttributeError):
+        code = None
+    return str(code or f"HTTP {error.code}")
 
 
 # ---------------------------------------------------------------------------
@@ -1000,9 +1260,11 @@ def _graph_request(
                 except Exception as refresh_err:
                     _verbose(f"mid-run refresh failed: {refresh_err}")
             raise
-        except urllib.error.URLError as e:
+        except NETWORK_ERRORS as e:
             last_err = e
-            time.sleep(2 ** attempt)
+            _verbose(f"network error on GET ({type(e).__name__}); attempt {attempt + 1}/{MAX_RETRIES}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
     if last_err:
         raise last_err
     raise RuntimeError("graph request exhausted retries without an error object")
@@ -1644,7 +1906,19 @@ def _show_effective_config(cfg: Config) -> None:
         "scopes": cfg.scopes,
         "graph_base": cfg.graph_base,
         "authority_base": cfg.authority_base,
+        "layout": cfg.layout,
+        "empresa": cfg.empresa,
+        "raw_root": cfg.raw_root,
+        "lock_path": cfg.lock_path,
+        "ingest_log_path": cfg.ingest_log_path,
+        "backfill_days": cfg.backfill_days,
+        "calendar_past_days": cfg.calendar_past_days,
+        "calendar_ahead_days": cfg.calendar_ahead_days,
+        "mail_exclude_folders": cfg.mail_exclude_folders,
+        "max_messages_per_run": cfg.max_messages_per_run,
+        "meetings_lookback_days": cfg.meetings_lookback_days,
     }
+    print(f"Profile: {_active_profile or '(none)'}")
     print(f"Config file: {CONFIG_PATH}")
     for key, value in shown.items():
         source = cfg.sources.get(key, "env" if key in {"graph_base", "authority_base"} else "default")
@@ -1667,13 +1941,62 @@ def cmd_configure(args: argparse.Namespace) -> int:
         updates["output_dir"] = validate_output_dir(args.output_dir)
     if args.vault_root is not None:
         updates["vault_root"] = str(Path(args.vault_root).expanduser().resolve())
+    if args.layout is not None:
+        updates["layout"] = args.layout
+    if args.empresa is not None:
+        updates["empresa"] = validate_empresa(args.empresa)
+    if args.raw_root is not None:
+        updates["raw_root"] = validate_vault_relative(args.raw_root, "raw_root")
+    if args.registros_dir is not None:
+        base = validate_vault_relative(args.registros_dir, "registros_dir")
+        updates["lock_path"] = f"{base}/.cerebro.lock"
+        updates["ingest_log_path"] = f"{base}/ingesta.log"
+    if args.lock_path is not None:
+        updates["lock_path"] = validate_vault_relative(args.lock_path, "lock_path")
+    if args.ingest_log_path is not None:
+        updates["ingest_log_path"] = validate_vault_relative(args.ingest_log_path, "ingest_log_path")
+    if args.backfill_days is not None:
+        updates["backfill_days"] = _int_in_range(args.backfill_days, "backfill_days", 0, 3650)
+    if args.calendar_past_days is not None:
+        updates["calendar_past_days"] = _int_in_range(args.calendar_past_days, "calendar_past_days", 0, 60)
+    if args.calendar_ahead_days is not None:
+        updates["calendar_ahead_days"] = _int_in_range(args.calendar_ahead_days, "calendar_ahead_days", 0, 60)
+    if args.mail_exclude_folders is not None:
+        updates["mail_exclude_folders"] = _folder_list(args.mail_exclude_folders)
+    if args.max_messages_per_run is not None:
+        updates["max_messages_per_run"] = _int_in_range(
+            args.max_messages_per_run, "max_messages_per_run", 1, 100000
+        )
+    if args.meetings_lookback_days is not None:
+        updates["meetings_lookback_days"] = _int_in_range(
+            args.meetings_lookback_days, "meetings_lookback_days", 1, 60
+        )
 
     if updates:
+        merged = dict(current)
+        merged.update(updates)
+        layout = str(merged.get("layout") or "legacy").lower()
+        if layout == "cerebro" and not merged.get("empresa"):
+            # `empresa` is inherited by every downstream note: never optional.
+            print(
+                "ERROR: el layout cerebro requiere --empresa <slug> (el nombre corto de la empresa, p. ej. acme). "
+                "No se guardó nada.",
+                file=sys.stderr,
+            )
+            return 2
         current.update(updates)
         _write_config_file(current)
         print(f"Configuration saved to {CONFIG_PATH}")
     elif not args.show:
         print("No changes requested. Use --show to inspect effective configuration.")
+
+    effective = load_config(require_client=False)
+    if effective.layout == "cerebro" and effective.vault_root:
+        siblings = _profiles_for_vault(effective.vault_root)
+        siblings[_active_profile or "-"] = effective.lock_path
+        conflict = _lock_conflict(effective.vault_root, effective.lock_path, siblings)
+        if conflict:
+            print(f"WARNING: {conflict}", file=sys.stderr)
 
     if args.show:
         cfg = load_config(overrides=updates, require_client=False)
@@ -2125,6 +2448,590 @@ def cmd_meetings(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# sync: non-interactive ingestion into the "cerebro" layout (v0.6)
+# ---------------------------------------------------------------------------
+
+class _SyncGraph:
+    """Read-only Graph adapter handed to sync_cerebro. Reuses _graph_request
+    (429 backoff, mid-run 401 refresh), retries 5xx twice, and turns HTTP
+    errors into sync_cerebro.GraphError / NeedsLogin. Only GET is exposed."""
+
+    def __init__(self, cfg: Config, token: str):
+        self.base = cfg.graph_base
+        self._token = token
+
+    def _get(self, url: str, accept: str = "application/json", prefer: str | None = None) -> bytes:
+        for attempt in range(3):
+            token = _current_access_token or self._token
+            try:
+                _, body, _ = _graph_request(url, token, accept=accept, prefer=prefer)
+                return body
+            except urllib.error.HTTPError as e:
+                raw = b""
+                try:
+                    raw = e.read()
+                except Exception:
+                    pass
+                code = message = inner = ""
+                try:
+                    err = json.loads(raw.decode("utf-8", errors="replace")).get("error") or {}
+                    code = str(err.get("code") or "")
+                    message = str(err.get("message") or "")
+                    inner_obj = err.get("innerError") or err.get("innererror") or {}
+                    inner = str(inner_obj.get("code") or "") if isinstance(inner_obj, dict) else ""
+                except (ValueError, AttributeError):
+                    pass
+                _verbose(f"Graph {e.code} {inner or code} on {url}")
+                # A 401 is reported as a GraphError: sync_cerebro decides whether
+                # it means "sign in again" by checking /me (a 401 on a single
+                # sub-resource, such as one transcript, is not a dead session).
+                if e.code in (500, 502, 503, 504) and attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise sync_cerebro.GraphError(e.code, code, message, inner) from None
+        raise sync_cerebro.GraphError(503, "retries_exhausted")
+
+    def get_json(self, url: str, prefer: str | None = None) -> dict[str, Any]:
+        data = json.loads(self._get(url, prefer=prefer).decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def get_text(self, url: str, accept: str) -> str:
+        return self._get(url, accept=accept).decode("utf-8", errors="replace")
+
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _norm_vault(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _norm_rel(path: str) -> str:
+    return path.replace("\\", "/").strip("/").lower() if _is_windows() else path.replace("\\", "/").strip("/")
+
+
+def _read_profile_file(profile: str) -> dict[str, Any]:
+    path = BASE_CONFIG_DIR / profile / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _discover_profiles(layout: str | None = "cerebro") -> list[str]:
+    """Profile slugs under the base config dir (alphabetical)."""
+    found: list[str] = []
+    try:
+        children = sorted(BASE_CONFIG_DIR.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    for child in children:
+        if not child.is_dir() or not PROFILE_RE.fullmatch(child.name):
+            continue
+        if not (child / "config.json").is_file():
+            continue
+        data = _read_profile_file(child.name)
+        if layout is None or str(data.get("layout") or "legacy").lower() == layout:
+            found.append(child.name)
+    return found
+
+
+def _profiles_for_vault(vault: str) -> dict[str, str]:
+    """{profile: lock_path} for every cerebro profile writing to this vault."""
+    target = _norm_vault(vault)
+    out: dict[str, str] = {}
+    for slug in _discover_profiles("cerebro"):
+        data = _read_profile_file(slug)
+        root = data.get("vault_root")
+        if root and _norm_vault(root) == target:
+            out[slug] = str(data.get("lock_path") or DEFAULT_LOCK_REL)
+    return out
+
+
+def _system3_lock_path(vault: str) -> tuple[bool, str | None]:
+    """(config.json exists, its lock_path) for <vault>/.claude/system3/config.json."""
+    path = Path(vault) / Path(*SYSTEM3_CONFIG_REL.split("/"))
+    if not path.is_file():
+        return False, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return True, None
+    value = data.get("lock_path") if isinstance(data, dict) else None
+    return True, (str(value) if value else None)
+
+
+def _lock_conflict(vault: str, lock_path: str, members: dict[str, str]) -> str | None:
+    """Reason why this vault would end up with more than one lock, or None."""
+    lock_paths = {_norm_rel(v) for v in members.values()} | {_norm_rel(lock_path)}
+    if len(lock_paths) > 1:
+        listed = ", ".join(f"{slug}={value}" for slug, value in sorted(members.items()))
+        return (
+            "los perfiles de este vault no coinciden en lock_path "
+            f"({listed}); un solo lock por vault es el contrato. Corrige con "
+            "`configure --profile <perfil> --lock-path <ruta>` en cada perfil."
+        )
+    exists, declared = _system3_lock_path(vault)
+    if exists and declared and _norm_rel(declared) != _norm_rel(lock_path):
+        return (
+            f"lock_path de ingest-outlook ({lock_path}) no coincide con el de "
+            f"{SYSTEM3_CONFIG_REL} ({declared}); un solo lock por vault es el contrato."
+        )
+    return None
+
+
+def _append_ingest_log(vault: str, rel: str, line: str) -> None:
+    try:
+        path = Path(vault) / Path(*validate_vault_relative(rel, "ingest_log_path").split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line + "\n")
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: no se pudo escribir el log de ingesta ({rel}): {exc}", file=sys.stderr)
+
+
+def _cerebro_config_problem(cfg: Config, vault: str | None) -> str | None:
+    if cfg.layout != "cerebro":
+        return "el perfil no tiene layout cerebro (configure --layout cerebro --empresa <slug>)"
+    if not cfg.empresa:
+        return "falta empresa: configure --empresa <slug> (nunca se escribe un crudo sin empresa)"
+    if not cfg.client_id:
+        return "falta client_id: configure --client-id <guid> --tenant-id <guid>"
+    if not vault:
+        return "falta vault_root: configure --vault-root <ruta>"
+    return None
+
+
+def _sync_one(
+    profile: str | None,
+    vault: str,
+    deadline: float,
+    dry_run: bool,
+    only: set[str],
+) -> sync_cerebro.RunResult:
+    global _non_interactive
+    _select_profile(profile)
+    label = profile or "-"
+    result = sync_cerebro.RunResult(perfil=label)
+    started = time.time()
+    try:
+        cfg = load_config(require_client=False)
+    except ValueError as exc:
+        result.estado = f"error: configuración inválida ({exc})"
+        result.exit_code = 2
+        return result
+    problem = _cerebro_config_problem(cfg, vault)
+    if problem:
+        result.estado = f"error: {problem}"
+        result.exit_code = 2
+        return result
+    settings = sync_cerebro.ProfileSettings(
+        slug=label,
+        empresa=cfg.empresa or "",
+        raw_root=cfg.raw_root,
+        backfill_days=cfg.backfill_days,
+        calendar_past_days=cfg.calendar_past_days,
+        calendar_ahead_days=cfg.calendar_ahead_days,
+        mail_exclude_folders=cfg.mail_exclude_folders,
+        max_messages_per_run=cfg.max_messages_per_run,
+        teams=cfg.teams,
+        meetings_lookback_days=cfg.meetings_lookback_days,
+    )
+    fix_hint = f"fix --profile {profile}" if profile else "fix"
+    runner: sync_cerebro.ProfileRun | None = None
+    previous_mode = _non_interactive
+    _non_interactive = True
+    try:
+        token = get_access_token(cfg)
+        runner = sync_cerebro.ProfileRun(
+            _SyncGraph(cfg, token), settings, TOKEN_DIR, Path(vault),
+            run_at=datetime.now().astimezone(), deadline=deadline, dry_run=dry_run,
+            only=only, out=print, verbose=_verbose,
+        )
+        result = runner.run()
+    except sync_cerebro.NeedsLogin as exc:
+        result = runner.result if runner else result
+        result.estado = f"requiere-login: requiere inicio de sesión, ejecuta {fix_hint}"
+        result.exit_code = EXIT_NEEDS_LOGIN
+        if not dry_run:
+            _write_needs_login(str(exc))
+    except sync_cerebro.GraphError as exc:
+        result = runner.result if runner else result
+        result.estado = f"error: Graph {exc.motive()}"
+        result.exit_code = 1
+    except urllib.error.HTTPError as exc:  # token endpoint 5xx/429
+        result = runner.result if runner else result
+        result.estado = f"error: servidor de inicio de sesión HTTP {exc.code}"
+        result.exit_code = 1
+    except NETWORK_ERRORS as exc:
+        result = runner.result if runner else result
+        result.estado = f"error: red, sin conexión con Microsoft ({type(exc).__name__})"
+        result.exit_code = 1
+    except OSError as exc:
+        result = runner.result if runner else result
+        result.estado = f"error: disco ({type(exc).__name__})"
+        result.exit_code = 1
+    except Exception as exc:  # never let one profile hide the others
+        result = runner.result if runner else result
+        result.estado = f"error: {type(exc).__name__}"
+        result.exit_code = 1
+        _log_event("sync", "failure", error_code=type(exc).__name__, extra={"detail": str(exc)[:300]})
+    finally:
+        _non_interactive = previous_mode
+    result.perfil = label
+    if result.exit_code == 0 and not dry_run:
+        _clear_needs_login()
+    _log_event(
+        "sync",
+        "success" if result.exit_code == 0 else "failure",
+        duration_ms=int((time.time() - started) * 1000),
+        extra={
+            "exit_code": result.exit_code,
+            "correo_nuevos": result.correo_nuevos,
+            "calendario_dias": result.calendario_dias,
+            "reuniones": result.reuniones,
+            "estado": result.estado,
+            "dry_run": dry_run,
+        },
+    )
+    return result
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Non-interactive ingestion (scheduled task, startup hook). Exit codes:
+    0 ok or skipped (lock busy), 1 error, 2 configuration, 4 needs login."""
+    original_profile = _active_profile
+    only = set(args.only or []) or {"mail", "calendar", "meetings"}
+    budget = _env_seconds("INGEST_OUTLOOK_SYNC_BUDGET_SECONDS", SYNC_BUDGET_SECONDS)
+    start_mono = _run_started_monotonic or time.monotonic()
+    deadline_total = start_mono + budget
+    dry_run = bool(args.dry_run)
+
+    if args.all:
+        if getattr(args, "_profile_explicit", False):
+            print("ERROR: usa --profile o --all, no ambos.", file=sys.stderr)
+            return 2
+        profiles: list[str | None] = list(_discover_profiles("cerebro"))
+        if not profiles:
+            print(
+                f"ERROR: no hay perfiles con layout cerebro en {BASE_CONFIG_DIR}. "
+                "Crea uno con `configure --profile <empresa> --layout cerebro --empresa <empresa> ...`.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        profiles = [original_profile]
+
+    worst = 0
+    groups: dict[str, list[tuple[str | None, Config, str]]] = {}
+    for profile in profiles:
+        _select_profile(profile)
+        label = profile or "-"
+        try:
+            cfg = load_config(require_client=False)
+        except ValueError as exc:
+            print(f"ERROR [{label}]: configuración inválida: {exc}", file=sys.stderr)
+            _log_event("sync", "failure", error_code="invalid_config", extra={"detail": str(exc)[:300]})
+            raw = _read_profile_file(profile) if profile else _read_config_file()
+            raw_vault = args.vault_root or raw.get("vault_root")
+            if raw_vault and str(raw.get("layout") or "").lower() == "cerebro" and not dry_run:
+                line = sync_cerebro.RunResult(perfil=label, estado=f"error: configuración inválida ({exc})")
+                try:
+                    log_rel = validate_vault_relative(str(raw.get("ingest_log_path") or DEFAULT_INGEST_LOG),
+                                                      "ingest_log_path")
+                except ValueError:
+                    log_rel = DEFAULT_INGEST_LOG
+                _append_ingest_log(str(raw_vault), log_rel, line.log_line(_now_local_iso()))
+            worst = max(worst, 2)
+            continue
+        vault = args.vault_root or cfg.vault_root
+        if args.all and args.vault_root and cfg.vault_root and _norm_vault(cfg.vault_root) != _norm_vault(args.vault_root):
+            continue  # another vault's profile
+        problem = _cerebro_config_problem(cfg, vault)
+        if problem:
+            print(f"ERROR [{label}]: {problem}", file=sys.stderr)
+            if vault and cfg.layout == "cerebro":
+                line = sync_cerebro.RunResult(perfil=label, estado=f"error: {problem}").log_line(_now_local_iso())
+                if not dry_run:
+                    _append_ingest_log(vault, cfg.ingest_log_path, line)
+            _log_event("sync", "failure", error_code="config", extra={"detail": problem})
+            worst = max(worst, 2)
+            continue
+        groups.setdefault(_norm_vault(vault), []).append((profile, cfg, str(Path(vault).expanduser())))
+
+    if not groups and worst == 0 and args.all:
+        print("ERROR: ningún perfil cerebro apunta a ese vault.", file=sys.stderr)
+        worst = 2
+
+    for members in groups.values():
+        vault = members[0][2]
+        lock_rel = members[0][1].lock_path
+        siblings = _profiles_for_vault(vault)
+        siblings.update({(p or "-"): c.lock_path for p, c, _ in members})
+        conflict = _lock_conflict(vault, lock_rel, siblings)
+        if conflict:
+            print(f"ERROR: {conflict}", file=sys.stderr)
+            _log_event("sync", "failure", error_code="lock_path_mismatch", extra={"detail": conflict})
+            if not dry_run:
+                for profile, cfg, _ in members:
+                    line = sync_cerebro.RunResult(
+                        perfil=profile or "-",
+                        estado="error: lock_path no coincide entre perfiles o con .claude/system3/config.json "
+                               "(un solo lock por vault); no se sincronizó",
+                    ).log_line(_now_local_iso())
+                    _append_ingest_log(vault, cfg.ingest_log_path, line)
+            worst = max(worst, 2)
+            continue
+
+        lock_notes: list[str] = []
+        lock: cerebro_lock.CerebroLock | None = None
+        if not dry_run:
+            lock = cerebro_lock.CerebroLock(
+                vault, "ingesta",
+                perfil=",".join(p or "-" for p, _, _ in members),
+                lock_path=lock_rel, note=lock_notes.append,
+            )
+            if not lock.acquire():
+                reason = f"saltada: lock ocupado por {cerebro_lock.describe_holder(lock.holder)}"
+                for profile, cfg, _ in members:
+                    line = sync_cerebro.RunResult(perfil=profile or "-", estado=reason).log_line(_now_local_iso())
+                    _append_ingest_log(vault, cfg.ingest_log_path, line)
+                    print(line)
+                continue
+        try:
+            for i, (profile, cfg, _) in enumerate(members):
+                remaining = max(0.0, deadline_total - time.monotonic())
+                soft_deadline = time.monotonic() + remaining / (len(members) - i)
+                result = _sync_one(profile, vault, soft_deadline, dry_run, only)
+                if i == 0 and lock_notes:
+                    result.notas = lock_notes + result.notas
+                line = result.log_line(_now_local_iso())
+                if dry_run:
+                    print(f"[dry-run] {line}")
+                else:
+                    _append_ingest_log(vault, cfg.ingest_log_path, line)
+                    print(line)
+                worst = max(worst, result.exit_code)
+        finally:
+            if lock is not None and not lock.release():
+                for note in lock_notes[-1:]:
+                    print(f"WARNING: {note}", file=sys.stderr)
+                _log_event("sync", "warning", error_code="lock_release_failed")
+
+    _select_profile(original_profile)
+    return worst
+
+
+# ---------------------------------------------------------------------------
+# schedule: Windows Task Scheduler (v0.6)
+# ---------------------------------------------------------------------------
+
+def _respaldo_doc() -> Path:
+    return _HERE / "docs" / "respaldo-hook-inicio.md"
+
+
+def _schedule_vault(args: argparse.Namespace) -> str | None:
+    """Vault the scheduled job syncs: --vault-root, the active profile's, or
+    the single vault shared by every cerebro profile."""
+    if args.vault_root:
+        return str(Path(args.vault_root).expanduser().resolve())
+    if _active_profile:
+        try:
+            cfg = load_config(require_client=False)
+        except ValueError:
+            return None
+        return cfg.vault_root
+    vaults = {
+        _norm_vault(root): str(root)
+        for root in (_read_profile_file(p).get("vault_root") for p in _discover_profiles("cerebro"))
+        if root
+    }
+    return next(iter(vaults.values())) if len(vaults) == 1 else None
+
+
+def _warn_nothing_to_sync(vault_root: str | None) -> None:
+    if _active_profile:
+        try:
+            cfg = load_config(require_client=False)
+        except ValueError as exc:
+            print(f"WARNING: {exc}", file=sys.stderr)
+            return
+        if cfg.layout != "cerebro":
+            print(f"WARNING: el perfil {_active_profile} no tiene layout cerebro; la tarea fallará hasta que lo tenga.",
+                  file=sys.stderr)
+        return
+    candidates = _profiles_for_vault(vault_root) if vault_root else {p: "" for p in _discover_profiles("cerebro")}
+    if not candidates:
+        print("WARNING: todavía no hay perfiles con layout cerebro; la tarea no tendrá nada que sincronizar.",
+              file=sys.stderr)
+
+
+def _schedule_macos(args: argparse.Namespace) -> int:
+    vault = _schedule_vault(args)
+    if not vault:
+        print(
+            "ERROR: no sé qué vault programar. Pasa --vault-root <ruta del vault> "
+            "(o configura los perfiles cerebro con el mismo vault_root).",
+            file=sys.stderr,
+        )
+        return 2
+    label = schedule_mac.label_for(vault)
+    plist = schedule_mac.plist_path(vault)
+    domain = schedule_mac.gui_domain()
+
+    if args.action == "status":
+        code, stdout, _stderr = schedule_mac.run_launchctl(["print", f"{domain}/{label}"])
+        if code != 0:
+            state = "instalada pero no cargada" if plist.exists() else "no está instalada"
+            print(f"La ingesta automática de {vault} {state} ({label}).")
+            return 1
+        info = schedule_mac.parse_print(stdout)
+        print(f"Agente: {label}")
+        print(f"Archivo: {plist}")
+        print(f"Estado: {info.get('estado', 'desconocido')}")
+        print(f"Corridas desde que se cargó: {info.get('corridas', '0')}")
+        print(f"Último resultado: {info.get('ultimo_resultado', 'todavía no ha corrido')}")
+        return 0
+
+    if args.action == "remove":
+        schedule_mac.run_launchctl(["bootout", f"{domain}/{label}"])
+        existed = plist.exists()
+        try:
+            plist.unlink()
+        except FileNotFoundError:
+            pass
+        print("Ingesta automática quitada." if existed else "La ingesta automática no estaba instalada.")
+        return 0
+
+    _warn_nothing_to_sync(vault)
+    environment = {}
+    if os.environ.get("INGEST_OUTLOOK_CONFIG_DIR"):
+        environment["INGEST_OUTLOOK_CONFIG_DIR"] = str(BASE_CONFIG_DIR)
+    content = schedule_mac.build_plist(
+        python=sys.executable,
+        fetch_path=str(Path(__file__).resolve()),
+        vault=vault,
+        every_minutes=args.every,
+        log_path=str(BASE_CONFIG_DIR / f"launchd-{schedule_mac.vault_hash(vault)}.log"),
+        environment=environment or None,
+        profile=_active_profile,
+    )
+    if args.dry_run:
+        print(content.decode("utf-8"))
+        return 0
+    try:
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        BASE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = plist.with_name(f".{plist.name}.tmp")
+        tmp.write_bytes(content)
+        os.replace(tmp, plist)
+    except OSError as exc:
+        print(f"ERROR: no se pudo escribir {plist}: {exc}", file=sys.stderr)
+        return 1
+    schedule_mac.run_launchctl(["bootout", f"{domain}/{label}"])  # idempotent re-install
+    code, stdout, stderr = schedule_mac.run_launchctl(["bootstrap", domain, str(plist)])
+    if code != 0:
+        print(
+            "No se pudo activar la ingesta automática en macOS (launchctl bootstrap falló: "
+            f"{(stderr or stdout).strip()[:300]}). El archivo quedó en {plist}; puedes "
+            "reintentar con `schedule install` o correr `sync --all` a mano.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Ingesta automática programada: {label}")
+    print(f"Corre cada {args.every} min mientras tu sesión de macOS esté abierta. Archivo: {plist}")
+    return 0
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    if _is_macos() and not _is_windows():
+        return _schedule_macos(args)
+    if not _is_windows():
+        print(
+            "La ingesta automática se programa en Windows (Programador de tareas) y en macOS "
+            "(LaunchAgent); en este sistema no se programó nada. Puedes correr "
+            f"`\"{sys.executable}\" \"{Path(__file__).resolve()}\" sync --all` desde cron o systemd por tu cuenta."
+        )
+        return 0
+
+    if args.action == "status":
+        code, stdout, stderr = schedule_win.run_powershell(schedule_win.build_status_script())
+        status = schedule_win.parse_status(stdout)
+        if code == schedule_win.EXIT_NOT_INSTALLED or not status.get("instalada"):
+            print(f"La tarea \"{schedule_win.TASK_NAME}\" no está instalada.")
+            if code not in (0, schedule_win.EXIT_NOT_INSTALLED) and stderr.strip():
+                print(stderr.strip(), file=sys.stderr)
+            return 1
+        print(f"Tarea: {status.get('ruta')}")
+        print(f"Estado: {status.get('estado')}")
+        print(f"Última ejecución: {status.get('ultima') or 'todavía no ha corrido'}")
+        print(f"Próxima ejecución: {status.get('proxima') or 'sin programar'}")
+        print(f"Último resultado: {schedule_win.describe_result(status.get('resultado'))}")
+        print(f"Acción: {status.get('accion')}")
+        return 0
+
+    if args.action == "remove":
+        code, stdout, stderr = schedule_win.run_powershell(schedule_win.build_remove_script())
+        if code != 0:
+            print(f"ERROR: no se pudo quitar la tarea: {(stderr or stdout).strip()[:400]}", file=sys.stderr)
+            return 1
+        removed = next((l.split("|", 1)[1] for l in stdout.splitlines() if l.startswith("REMOVED|")), "0")
+        print("Tarea quitada." if removed.strip() not in ("", "0") else "La tarea no estaba instalada.")
+        return 0
+
+    # install
+    vault_root = str(Path(args.vault_root).expanduser().resolve()) if args.vault_root else None
+    _warn_nothing_to_sync(vault_root)
+    pythonw, found = schedule_win.pythonw_for(sys.executable)
+    if not found:
+        print(f"WARNING: no se encontró pythonw.exe junto a {sys.executable}; la tarea abrirá una ventana al correr.",
+              file=sys.stderr)
+    fetch_path = str(Path(__file__).resolve())
+    spec = schedule_win.ScheduleSpec(
+        execute=pythonw,
+        arguments=schedule_win.build_action_arguments(fetch_path, _active_profile, vault_root),
+        working_dir=str(_HERE),
+        start=args.start,
+        every_minutes=args.every,
+        hours=args.hours,
+    )
+    script = schedule_win.build_register_script(spec)
+    if args.dry_run:
+        print(script)
+        return 0
+    code, stdout, stderr = schedule_win.run_powershell(script)
+    registered = next((l.split("|", 1)[1] for l in stdout.splitlines() if l.startswith("REGISTERED|")), None)
+    if code == 0 and registered:
+        print(f"Tarea programada: {registered.strip()}")
+        print(f"Corre de lunes a viernes desde las {spec.start}, cada {spec.every_minutes} min durante "
+              f"{spec.hours} h, solo con tu sesión de Windows iniciada.")
+        if "\\Rewired\\" not in registered:
+            print("Nota: Windows no dejó crear la carpeta \\Rewired\\; la tarea quedó en la raíz del Programador.")
+        return 0
+    if code == schedule_win.EXIT_DENIED:
+        print(
+            "No se pudo crear la tarea programada: Windows negó el acceso (política de la empresa "
+            "para usuarios estándar). La ingesta NO queda automática cada 30 minutos.\n"
+            "Respaldo: lanzarla desde el hook de inicio de Claude Code (corre cada vez que abres "
+            f"Claude en el vault). Instrucciones: {_respaldo_doc()}\n"
+            "También puedes pedirle a TI que permita tareas programadas para tu usuario.",
+            file=sys.stderr,
+        )
+        return schedule_win.EXIT_DENIED
+    detail = (stdout + "\n" + stderr).strip()
+    print(f"ERROR: no se pudo crear la tarea programada: {detail[:600]}", file=sys.stderr)
+    return 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     print(f"ingest-outlook fetch.py v{__version__}")
     return 0
@@ -2185,6 +3092,8 @@ def _fix_full_reauth(client_id_arg: str | None = None) -> tuple[bool, str]:
     try:
         token = _run_oauth_flow(cfg)
         _save_token(token)
+        _clear_needs_login()
+        _clear_cached_account()
         return True, f"Re-authenticated. Token cached, expires in {int(token.get('expires_in', 0))}s."
     except SystemExit:
         return False, "OAuth flow was cancelled or timed out."
@@ -2400,7 +3309,61 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
     else:
         results.append(CheckResult(PASS, "vault", "(no --vault-root provided; skipping check)"))
 
-    # 9. LOG / AUDIT files writable
+    # 9. NEEDS-LOGIN sentinel (written by sync, which never opens a browser)
+    if NEEDS_LOGIN_PATH.is_file():
+        auth_ok = any(r.name == "auth" and r.status == PASS for r in results)
+        if auth_ok:
+            results.append(CheckResult(
+                WARN, "needs-login",
+                "sync marked this profile as needing sign-in, but the session works now.",
+                fix_auto=lambda: (_clear_needs_login() or True, "Cleared the needs-login marker."),
+            ))
+        else:
+            results.append(CheckResult(
+                FAIL, "needs-login",
+                "The scheduled sync needs a person to sign in again (exit 4). "
+                f"Run: {_command_hint('fix')}",
+                # The token/auth checks above carry the re-authentication fix;
+                # a successful sign-in clears this marker.
+                fix_manual=[f"Run: {_command_hint('fix')} and sign in in the browser."],
+            ))
+
+    # 10. CEREBRO layout: empresa, single vault lock, lock state
+    if cfg.layout == "cerebro":
+        if not cfg.empresa:
+            results.append(CheckResult(
+                FAIL, "empresa",
+                "Layout cerebro without empresa: sync refuses to write raw files without it.",
+                fix_manual=[f"Run: {_command_hint('configure')} --empresa <slug>"],
+            ))
+        else:
+            results.append(CheckResult(PASS, "empresa", f"empresa={cfg.empresa}"))
+        if vault_root:
+            siblings = _profiles_for_vault(vault_root)
+            siblings[_active_profile or "-"] = cfg.lock_path
+            conflict = _lock_conflict(vault_root, cfg.lock_path, siblings)
+            exists, declared = _system3_lock_path(vault_root)
+            if conflict:
+                results.append(CheckResult(FAIL, "vault-lock", conflict, fix_manual=[
+                    f"Align lock_path in every profile: {_command_hint('configure')} --lock-path <path>",
+                ]))
+            elif exists and not declared:
+                results.append(CheckResult(
+                    WARN, "vault-lock",
+                    f"{SYSTEM3_CONFIG_REL} does not declare lock_path; other processes may use "
+                    f"their own default instead of {cfg.lock_path}.",
+                ))
+            else:
+                state = cerebro_lock.lock_status(vault_root, cfg.lock_path)
+                if state["estado"] == "abandonado":
+                    results.append(CheckResult(
+                        WARN, "vault-lock",
+                        f"abandoned lock at {state['ruta']} (the next run steals it)",
+                    ))
+                else:
+                    results.append(CheckResult(PASS, "vault-lock", f"{cfg.lock_path}: {state['estado']}"))
+
+    # 11. LOG / AUDIT files writable
     try:
         _ensure_config_dir()
         log_ok = audit_ok = True
@@ -2550,9 +3513,14 @@ def cmd_fix(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    global _run_started_at
+    global _run_started_at, _run_started_monotonic
+    # pythonw.exe (scheduled task) starts with sys.stdout/sys.stderr = None.
+    for stream_name in ("stdout", "stderr"):
+        if getattr(sys, stream_name) is None:
+            setattr(sys, stream_name, open(os.devnull, "w", encoding="utf-8"))
     _configure_console_encoding()
     _run_started_at = time.time()
+    _run_started_monotonic = time.monotonic()
 
     parser = argparse.ArgumentParser(
         description="Fetch Outlook data via Microsoft Graph for ingest-outlook.",
@@ -2571,6 +3539,12 @@ def main() -> int:
         "--quiet",
         action="store_true",
         help="Suppress normal output. Used by session-start hooks.",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Profile slug (config, token, logs and state under <config-dir>/<slug>/). "
+             "Env: INGEST_OUTLOOK_PROFILE.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2591,8 +3565,53 @@ def main() -> int:
     shared_group.add_argument("--no-shared-calendars", dest="shared_calendars", action="store_false")
     p_config.add_argument("--output-dir", default=None, help="Relative output directory inside the vault.")
     p_config.add_argument("--vault-root", default=None, help="Default vault root path.")
+    p_config.add_argument("--layout", choices=LAYOUTS, default=None,
+                          help="legacy (v0.5 External Inputs/Outlook) or cerebro (System 3 raw layer, used by sync).")
+    p_config.add_argument("--empresa", default=None, help="Company slug written in every raw file (required for cerebro).")
+    p_config.add_argument("--raw-root", default=None, help=f"Raw root inside the vault (default {DEFAULT_RAW_ROOT}).")
+    p_config.add_argument("--lock-path", default=None, help=f"Vault lock, relative to the vault (default {DEFAULT_LOCK_REL}).")
+    p_config.add_argument("--ingest-log-path", default=None,
+                          help=f"Ingestion log, relative to the vault (default {DEFAULT_INGEST_LOG}).")
+    p_config.add_argument("--registros-dir", default=None,
+                          help="Convenience: sets lock_path=<dir>/.cerebro.lock and ingest_log_path=<dir>/ingesta.log "
+                               "(explicit --lock-path/--ingest-log-path win).")
+    p_config.add_argument("--backfill-days", default=None, help="First sync: days of mail to bring (default 30).")
+    p_config.add_argument("--calendar-past-days", default=None, help="Calendar days before today (default 1).")
+    p_config.add_argument("--calendar-ahead-days", default=None, help="Calendar days after today (default 14).")
+    p_config.add_argument("--mail-exclude-folders", default=None,
+                          help="Comma-separated well-known folder names (default junkemail,deleteditems,drafts).")
+    p_config.add_argument("--max-messages-per-run", default=None, help="Mail cap per sync run (default 1000).")
+    p_config.add_argument("--meetings-lookback-days", default=None,
+                          help="Days back to look for Teams transcripts (default 7).")
     p_config.add_argument("--show", action="store_true", help="Print effective values and their sources.")
     p_config.set_defaults(func=cmd_configure)
+
+    p_sync = subparsers.add_parser(
+        "sync",
+        help="Non-interactive ingestion into the cerebro layout (whole mailbox, calendar, Teams transcripts). "
+             "Never opens a browser; exit 4 = a person must run `fix --profile X`.",
+    )
+    p_sync.add_argument("--all", action="store_true",
+                        help="Every cerebro profile of the vault, alphabetically, under one vault lock.")
+    p_sync.add_argument("--vault-root", default=None, help="Vault root; with --all, only profiles of this vault.")
+    p_sync.add_argument("--dry-run", action="store_true",
+                        help="Do everything except writing the vault, watermarks or indices; print what would be written.")
+    p_sync.add_argument("--only", action="append", choices=["mail", "calendar", "meetings"], default=None,
+                        help="Limit to one source (repeatable).")
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_sched = subparsers.add_parser(
+        "schedule",
+        help="Automatic sync: Windows task \\Rewired\\Cerebro - ingesta (Mon-Fri, every 30 min) or a "
+             "macOS LaunchAgent (every 30 min). Other systems: message only.",
+    )
+    p_sched.add_argument("action", choices=["install", "remove", "status"])
+    p_sched.add_argument("--vault-root", default=None, help="Vault whose profiles the task syncs (optional).")
+    p_sched.add_argument("--every", type=int, default=30, help="Minutes between runs (default 30).")
+    p_sched.add_argument("--start", default="07:00", help="First run of the day, HH:MM (default 07:00).")
+    p_sched.add_argument("--hours", type=int, default=12, help="Hours the repetition lasts (default 12: 07:00-19:00).")
+    p_sched.add_argument("--dry-run", action="store_true", help="Print the PowerShell that install would run.")
+    p_sched.set_defaults(func=cmd_schedule)
 
     p_mail = subparsers.add_parser("mail", help="Fetch Outlook messages.")
     p_mail.add_argument("--scope", required=True, help="Folder name or search query.")
@@ -2722,8 +3741,22 @@ def main() -> int:
     p_ver = subparsers.add_parser("version", help="Print the script version.")
     p_ver.set_defaults(func=cmd_version)
 
+    # `--profile` works before or after the subcommand.
+    for sub in subparsers.choices.values():
+        sub.add_argument("--profile", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
     args = parser.parse_args()
     command_name = args.command
+    explicit_profile = getattr(args, "profile", None)
+    args._profile_explicit = bool(explicit_profile)
+    env_profile = os.environ.get("INGEST_OUTLOOK_PROFILE", "").strip() or None
+    if command_name == "sync" and getattr(args, "all", False):
+        env_profile = None  # --all iterates profiles; the env default does not apply
+    try:
+        _select_profile(explicit_profile or env_profile)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     global _verbose_mode, _quiet_mode
     _verbose_mode = bool(getattr(args, "verbose", False))
