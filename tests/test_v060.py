@@ -1041,7 +1041,7 @@ class ScheduleTests(unittest.TestCase):
                 self.assertEqual(module.cmd_schedule(self._args("remove", vault)), 0)
                 self.assertFalse(plist.exists())
             label = schedule_mac.label_for(vault)
-            domain = f"gui/{os.getuid()}"
+            domain = schedule_mac.gui_domain()
             self.assertIn(["bootstrap", domain, str(plist)], calls)
             self.assertIn(["print", f"{domain}/{label}"], calls)
             self.assertIn(["bootout", f"{domain}/{label}"], calls)
