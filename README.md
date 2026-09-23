@@ -56,7 +56,7 @@ That's it. The skill is now loaded into your Claude Code agent, and you can inte
 For a managed corporate account, the recommended setup is the read-only profile. Open PowerShell and run these commands, replacing `<cargo>`, `<client-id>` and `<tenant-id>` with the values for your vault and tenant:
 
 ```powershell
-git clone --branch v0.5.0 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
+git clone --branch v0.5.1 https://github.com/danilobrando/ingest-outlook.git "$env:LOCALAPPDATA\ingest-outlook"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\ingest-outlook\install.ps1" -VaultRoot "$env:USERPROFILE\cerebros\<cargo>" -ClientId "<client-id>" -TenantId "<tenant-id>" -ReadOnly
 py -3 "$env:USERPROFILE\cerebros\<cargo>\.claude\skills\ingest-outlook\fetch.py" fix
 ```
