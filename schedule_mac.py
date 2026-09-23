@@ -21,7 +21,6 @@ __license__ = "MIT"
 
 import hashlib
 import os
-import plistlib
 import re
 import subprocess
 from pathlib import Path
@@ -54,6 +53,34 @@ def program_arguments(python: str, fetch_path: str, vault: str, profile: str | N
     return [python, fetch_path, "sync", "--all", "--vault-root", vault]
 
 
+def _xml_text(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _plist_value(value: Any, indent: str) -> list[str]:
+    """Minimal plist XML writer (bool, int, str, list, dict). Written by hand
+    so fetch.py does not depend on plistlib/pyexpat being importable."""
+    inner = indent + "\t"
+    if isinstance(value, bool):
+        return [f"{indent}<{'true' if value else 'false'}/>"]
+    if isinstance(value, int):
+        return [f"{indent}<integer>{value}</integer>"]
+    if isinstance(value, str):
+        return [f"{indent}<string>{_xml_text(value)}</string>"]
+    if isinstance(value, (list, tuple)):
+        lines = [f"{indent}<array>"]
+        for item in value:
+            lines += _plist_value(item, inner)
+        return lines + [f"{indent}</array>"]
+    if isinstance(value, dict):
+        lines = [f"{indent}<dict>"]
+        for key in sorted(value):
+            lines.append(f"{inner}<key>{_xml_text(str(key))}</key>")
+            lines += _plist_value(value[key], inner)
+        return lines + [f"{indent}</dict>"]
+    raise TypeError(f"unsupported plist value: {type(value).__name__}")
+
+
 def build_plist(
     python: str,
     fetch_path: str,
@@ -78,7 +105,14 @@ def build_plist(
         data["StandardErrorPath"] = log_path
     if environment:
         data["EnvironmentVariables"] = dict(environment)
-    return plistlib.dumps(data, fmt=plistlib.FMT_XML, sort_keys=True)
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+        '<plist version="1.0">',
+        *_plist_value(data, ""),
+        "</plist>",
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def gui_domain() -> str:

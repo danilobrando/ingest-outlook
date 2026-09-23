@@ -980,7 +980,13 @@ class ScheduleTests(unittest.TestCase):
             python="/usr/local/bin/python3", fetch_path="/opt/ingest-outlook/fetch.py", vault=vault,
             every_minutes=30, log_path="/tmp/launchd.log", environment={"INGEST_OUTLOOK_CONFIG_DIR": "/x"},
         )
-        import plistlib
+        text = content.decode("utf-8")
+        self.assertIn("<key>StartInterval</key>\n\t<integer>1800</integer>", text)
+        self.assertIn(f"<string>{vault}</string>", text)
+        try:
+            import plistlib
+        except ImportError as exc:  # e.g. a Python build whose pyexpat is broken
+            self.skipTest(f"plistlib unavailable to round-trip the plist: {exc}")
         data = plistlib.loads(content)
         label = schedule_mac.label_for(vault)
         self.assertRegex(label, r"^com\.cerebro\.ingesta\.[0-9a-f]{8}$")
@@ -994,6 +1000,8 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(schedule_mac.label_for(vault + "/"), label)  # same vault, same agent
         self.assertNotEqual(schedule_mac.label_for("/Users/ana/cerebros/otro"), label)
         with_profile = plistlib.loads(schedule_mac.build_plist("/py", "/f.py", vault, profile="acme"))
+        tricky = plistlib.loads(schedule_mac.build_plist("/py", "/f.py", "/Users/a&b/<x> é"))
+        self.assertEqual(tricky["ProgramArguments"][-1], "/Users/a&b/<x> é")
         self.assertEqual(with_profile["ProgramArguments"][2:5], ["--profile", "acme", "sync"])
 
     def test_macos_install_status_remove_via_seam(self):
