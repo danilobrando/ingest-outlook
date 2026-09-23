@@ -12,6 +12,16 @@
 - **Doctor**: `needs-login`, `empresa` and `vault-lock` checks.
 - **Tests and CI**: the fake Graph moved to `tests/fake_graph.py` (module and script); v0.6 coverage for the raw-file contract, immutability, watermarks, caps, calendar rewrites, Teams, exit 4 without a browser, one lock for `--all`, budget, concurrency, stolen and busy locks, dry-run, profiles and scheduling. Windows CI installs two profiles with `install.ps1 -Layout cerebro`, runs both syncs in parallel against the fake Graph, and registers, inspects and removes the scheduled task. Python 3.14 added to the matrix.
 - Docs: generic installation guide, IT app-registration guide, startup-hook fallback and Teams transcripts research.
+- Hardening after an adversarial review (each item has a regression test in `tests/test_v060_review.py`):
+  - Teams transcripts get their own lookback, `meetings_lookback_days` (7), with a separate calendar query for past online meetings; before, a meeting older than yesterday was never fetched.
+  - Mail uses keyset pagination (`receivedDateTime ge <last seen>`, no `$skip` nextLinks) and each run re-reads from the watermark minus 10 minutes; re-reads of known ids are free (no cap, no budget), which also removes a livelock with more same-second messages than the cap.
+  - Mail and attachment requests send `Prefer: outlook.body-content-type="text", IdType="ImmutableId"`: moving a message no longer creates a duplicate. `internetMessageId` is recorded (`id_internet`) and used as a second dedup key.
+  - Stage order is mail, calendar, meetings, and any exception in a stage is contained and logged by class (no personal data). Timeouts, connection resets and `http.client` errors are retried like `URLError` and logged as `red`. A 401 on one sub-resource is a dead session only if `/me` fails too.
+  - A message whose attachment list fails is written with `adjuntos: []` and `adjuntos_error: true`; one that fails to write three runs in a row goes to `<profile>/skipped.txt` and the watermark advances.
+  - Messages seen in excluded folders are remembered 7 days (max 200); up to 50 per run are re-checked by id and written if rescued.
+  - Windows task: the principal is the current user's SID; any failure registering in `\Rewired\` falls back to the root folder; `install.ps1 -Schedule` only warns (in Spanish, pointing to the startup-hook fallback) when scheduling fails, and trims a trailing backslash from the vault path.
+  - Vault lock: `acquire` no longer busy-spins; stealing renames the abandoned lock aside and checks it moved the stale one (puts back a renewed lock); `release()` returns False when it cannot delete the file; the CLI `release` requires the `--pid` and `--inicio` printed by `acquire`.
+  - A `lock_path` mismatch also writes a line to the ingest log; the first participant falls back to `sender` when `from` has no address; stale `.<name>.<pid>.tmp` files older than 30 min are removed from `raw_root`; `empresa` is always quoted in frontmatter.
 
 ## 0.5.1
 
