@@ -123,9 +123,9 @@ Do NOT use for:
 | Subcommand | Read/Write | Scope required | Output |
 |---|---|---|---|
 | `mail` | Read | `Mail.Read` | Vault file under configured output `/Mail/<folder>/<date>.md` |
-| `calendar --days N [--ahead 0..60]` | Read | `Calendars.Read` (own) or `Calendars.Read.Shared` (shared) | Vault file under configured output `/Calendar/<date>.md` |
-| `meetings` | Read | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (corporate only) | Vault file under configured output `/Meetings/<date>.md` |
-| `list-calendars` | Read | `Calendars.Read`; shared entries require `Calendars.Read.Shared` | Human-readable list on stdout |
+| `calendar --days N [--ahead 0..60]` | Read | `Calendars.Read` (own). Shared calendars only when `shared_calendars` is enabled. Read-only without that flag sees own calendars only | Vault file under configured output `/Calendar/<date>.md` |
+| `meetings` | Read | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` (only when an admin enabled `teams`) | Vault file under configured output `/Meetings/<date>.md` |
+| `list-calendars` | Read | `Calendars.Read`; shared entries require `shared_calendars` (`Calendars.Read.Shared`). Without that, read-only mode lists own calendars only | Human-readable list on stdout |
 | `send-mail` | **Write** | `Mail.Send` | Confirmation line on stdout |
 | `event-create` | **Write** | `Calendars.ReadWrite` | Event id + subject on stdout |
 | `event-update` | **Write** | `Calendars.ReadWrite` | Updated event id + changed fields on stdout |
@@ -134,6 +134,12 @@ Do NOT use for:
 ### Read-only profile contract
 
 When the effective configuration has `read_only: true`, `send-mail`, `event-create`, `event-update`, and `event-delete` do not exist as capabilities for the agent. Do not offer, suggest, simulate, or attempt those commands, including with `--dry-run`. The connector enforces this locally before requesting a token, but the agent must also honor the policy at planning time. Do not access shared or delegated mailboxes/calendars unless `shared_calendars` was explicitly enabled by the operator.
+
+In the read-only profile without `shared_calendars`, `list-calendars` and `calendar` only see the signed-in user's own calendars. They do not list or read calendars that were shared with that user.
+
+`meetings` exists only when an administrator enabled Teams for this connector (`teams: true`, which needs admin consent). In the read-only profile without Teams, do not offer or attempt `meetings`.
+
+Exit code 3 means the organization read-only policy blocked the command before any Microsoft call. It is not a connector error, a bad login, or something `fix` can repair. Explain that to the user as a company policy: the action is not allowed here. Do not describe it as a failure or a bug.
 
 ## Personal vs corporate Microsoft accounts
 
@@ -245,6 +251,8 @@ Pulls `/me/calendarView` from the start of the local day `(today - days + 1)` th
 ```
 
 For each calendar event with `onlineMeeting.joinUrl`, resolves the `onlineMeeting` object, lists transcripts, and downloads transcript content as VTT. Output: `External Inputs/Outlook/Meetings/<YYYY-MM-DD>.md`.
+
+`meetings` is available only if an administrator enabled Teams (`teams: true`). Read-only mode without Teams exits 3 before requesting a token. Tell the user that is company policy, not an error.
 
 Personal Microsoft accounts: the subcommand prints a warning and emits a zero-meeting payload. The vault file is still written for idempotency.
 
@@ -459,6 +467,9 @@ Every error message printed by the connector ends with a hint pointing to `fix`.
 - Mail `$search` returns zero results: empty payload, `ingest.py` writes a `message_count: 0` file. Not a failure.
 - Calendar/meetings window has zero items: empty payload, vault file still written for idempotency.
 - Teams not available on personal tenant: `meetings` subcommand warns + emits empty payload.
+- Read-only profile without Teams: `meetings` exits 3 (`blocked_read_only`) before requesting a token. That is organization policy, not a connector error. Do not run `fix` to "repair" it.
+- Read-only profile without `shared_calendars`: `calendar` and `list-calendars` see only the user's own calendars.
+- Exit code 3 from a write command or from `meetings`: explain the company policy. Do not treat it as a bug.
 - Transcript not available for a meeting: that meeting's transcript array is empty; meeting still in output.
 - HTTP 429 throttling: respects `Retry-After`, retries up to 3 times.
 - AADSTS error codes (50158/50173/70008/65001/90094/50076/etc.): the `_post_token` handler maps known codes to a human-readable next action.

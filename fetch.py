@@ -96,6 +96,10 @@ DEFAULT_READ_ONLY_SCOPES = [
 ]
 DEFAULT_OUTPUT_DIR = "External Inputs/Outlook"
 EXIT_READ_ONLY_BLOCKED = 3
+# Entra often omits these from the token `scope` even when consent succeeded.
+# Treating them as missing makes `doctor`/`fix` re-authenticate forever.
+PROTOCOL_SCOPES = frozenset({"offline_access", "openid", "profile", "email"})
+GRAPH_SCOPE_PREFIX = "https://graph.microsoft.com/"
 
 TOKEN_DIR = Path(
     os.environ.get(
@@ -225,7 +229,7 @@ AADSTS_HANDLERS: dict[str, tuple[str, str]] = {
     ),
     "AADSTS50011": (
         "The redirect URI does not match the app registration.",
-        "Configure http://localhost:8765/callback under the app's 'Mobile and desktop applications' platform.",
+        "Configure {redirect_uri} under the app's 'Mobile and desktop applications' platform.",
     ),
     "AADSTS7000218": (
         "The app is not configured as a public client and Microsoft expected a client secret.",
@@ -238,12 +242,20 @@ AADSTS_HANDLERS: dict[str, tuple[str, str]] = {
 }
 
 
-def explain_aadsts(error_body: str) -> str | None:
+def explain_aadsts(error_body: str, redirect_uri: str | None = None) -> str | None:
     """Scan an error body for a known AADSTS code. Returns a multi-line
     human-readable explanation, or None if no known code matches.
+
+    AADSTS50011 names the redirect URI from the active config (the port is
+    configurable). Callers that have a Config should pass redirect_uri.
     """
+    uri = redirect_uri or "http://localhost:8765/callback"
     for code, (desc, fix) in AADSTS_HANDLERS.items():
         if code in error_body:
+            # AADSTS500113 contains the substring AADSTS50011; the catalogue
+            # lists 500113 first so the longer code wins.
+            if "{redirect_uri}" in fix:
+                fix = fix.format(redirect_uri=uri)
             return f"\n  Error code:  {code}\n  Meaning:     {desc}\n  Next action: {fix}"
     return None
 
@@ -375,14 +387,42 @@ class Config:
         return self.tenant_id in ("common", "consumers")
 
 
+# Set when config.json exists but cannot be used. Doctor reports it as FAIL.
+_config_file_error: str | None = None
+
+
 def _read_config_file() -> dict[str, Any]:
+    """Load config.json. A missing file is empty config, not an error.
+
+    UTF-8 BOM (Notepad on Windows) is accepted. Invalid JSON or a non-object
+    is reported on stderr and treated as empty so the process can continue;
+    it is not a silent {}.
+    """
+    global _config_file_error
+    _config_file_error = None
     if not CONFIG_PATH.is_file():
         return {}
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        _config_file_error = str(exc)
+        print(
+            f"config.json inválido en {CONFIG_PATH}: {exc}; "
+            "corre `configure` para regenerarlo",
+            file=sys.stderr,
+        )
         return {}
+    if not isinstance(data, dict):
+        _config_file_error = (
+            f"se esperaba un objeto JSON, se recibió {type(data).__name__}"
+        )
+        print(
+            f"config.json inválido en {CONFIG_PATH}: {_config_file_error}; "
+            "corre `configure` para regenerarlo",
+            file=sys.stderr,
+        )
+        return {}
+    return data
 
 
 def _parse_bool(value: Any, default: bool = False) -> bool:
@@ -497,6 +537,19 @@ def load_config(
     if scopes_env:
         scopes = scopes_env.split()
         sources["scopes"] = "env"
+        if read_only:
+            scopes, discarded = _filter_read_only_scopes(scopes)
+            if discarded:
+                # MS_GRAPH_SCOPES must not reopen write access under read-only.
+                sources["scopes"] = "env (filtered: read-only)"
+                listed = ", ".join(discarded)
+                print(
+                    "WARNING: read-only profile discarded write scopes from "
+                    f"MS_GRAPH_SCOPES: {listed}. / "
+                    "ADVERTENCIA: el perfil de solo lectura descartó scopes de "
+                    f"escritura de MS_GRAPH_SCOPES: {listed}.",
+                    file=sys.stderr,
+                )
     elif read_only:
         scopes = list(DEFAULT_READ_ONLY_SCOPES)
         if shared_calendars:
@@ -562,16 +615,63 @@ def _save_token(token: dict[str, Any]) -> None:
     _chmod_private(TOKEN_PATH, 0o600)
 
 
+def _normalize_scope(scope: str) -> str:
+    """Strip a Graph resource prefix and surrounding whitespace.
+
+    Entra sometimes returns `https://graph.microsoft.com/Mail.Read` instead of
+    the short scope name we requested.
+    """
+    text = str(scope).strip()
+    if text.lower().startswith(GRAPH_SCOPE_PREFIX):
+        text = text[len(GRAPH_SCOPE_PREFIX):]
+    return text.strip()
+
+
+def _is_protocol_scope(scope: str) -> bool:
+    return _normalize_scope(scope).lower() in PROTOCOL_SCOPES
+
+
+def _scope_is_write(scope: str) -> bool:
+    """True for Graph write scopes. `.Read.All` is read-only and must stay."""
+    lowered = _normalize_scope(scope).lower()
+    return "readwrite" in lowered or ".send" in lowered
+
+
+def _filter_read_only_scopes(scopes: list[str]) -> tuple[list[str], list[str]]:
+    kept: list[str] = []
+    discarded: list[str] = []
+    for scope in scopes:
+        if _scope_is_write(scope):
+            discarded.append(scope)
+        else:
+            kept.append(scope)
+    return kept, discarded
+
+
 def verify_scopes(token: dict[str, Any], required: list[str]) -> tuple[bool, list[str]]:
     """Compare the token's `scopes_granted` against a required list. Returns
     (all_present, missing_scopes). If the token has no scopes_granted field
     (legacy token from before we tracked this), returns (True, []) and
     lets the operation proceed.
+
+    Comparison is case-insensitive. Granted scopes may use the
+    `https://graph.microsoft.com/` prefix. `offline_access`, `openid`,
+    `profile`, and `email` are protocol scopes: Entra may omit them from the
+    token response even after consent, so they are not treated as missing.
     """
-    granted = set(token.get("scopes_granted") or [])
-    if not granted:
+    raw_granted = token.get("scopes_granted") or []
+    if not raw_granted:
         return True, []
-    missing = [s for s in required if s not in granted]
+    granted = {
+        _normalize_scope(scope).lower()
+        for scope in raw_granted
+        if not _is_protocol_scope(str(scope))
+    }
+    missing = [
+        scope for scope in required
+        if not _is_protocol_scope(str(scope))
+        and _normalize_scope(str(scope)).lower() not in granted
+    ]
     return not missing, missing
 
 
@@ -775,7 +875,7 @@ def _post_token(config: Config, data: bytes) -> dict[str, Any]:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        explanation = explain_aadsts(body)
+        explanation = explain_aadsts(body, redirect_uri=config.redirect_uri)
         print(f"ERROR: token endpoint returned HTTP {e.code}.", file=sys.stderr)
         if explanation:
             print(explanation, file=sys.stderr)
@@ -1945,6 +2045,22 @@ def cmd_event_delete(args: argparse.Namespace) -> int:
 
 def cmd_meetings(args: argparse.Namespace) -> int:
     cfg = load_config(args.client_id, getattr(args, "vault_root", None))
+    if cfg.read_only and not cfg.teams:
+        # Block before any token request. Teams transcripts are not part of
+        # the read-only profile unless the operator explicitly enabled teams.
+        print(
+            "BLOCKED: meetings is disabled because the read-only profile does not "
+            "include Teams. No token was requested. Ask an administrator to enable "
+            "Teams for this connector if your organization allows it. / "
+            "BLOQUEADO: meetings está deshabilitado porque el perfil de solo lectura "
+            "no incluye Teams. No se solicitó un token. Pide a un administrador que "
+            "habilite Teams para este conector si tu organización lo permite.",
+            file=sys.stderr,
+        )
+        summary = {"teams": cfg.teams, "read_only": cfg.read_only}
+        _audit_action("meetings", "blocked_read_only", summary)
+        _log_event("meetings", "blocked_read_only")
+        return EXIT_READ_ONLY_BLOCKED
     vault_root = _vault_root_or_error(args, cfg)
     if cfg.is_personal_tenant:
         print(
@@ -2073,7 +2189,17 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
     vault_root = vault_root or cfg.vault_root
 
     # 1. CONFIG
-    if not client_id:
+    if _config_file_error:
+        results.append(CheckResult(
+            FAIL, "config",
+            f"config.json inválido en {CONFIG_PATH}: {_config_file_error}",
+            fix_manual=[
+                "The configuration file exists but is not a JSON object.",
+                f"Regenerate it with: {_command_hint('configure')} --client-id <guid> --tenant-id <guid>",
+                "corre `configure` para regenerarlo",
+            ],
+        ))
+    elif not client_id:
         results.append(CheckResult(
             FAIL, "config",
             "Microsoft Graph client ID is not configured.",
