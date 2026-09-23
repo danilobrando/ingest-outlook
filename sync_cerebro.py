@@ -47,10 +47,25 @@ MAX_PATH_CHARS = 240
 MAX_SLUG_CHARS = 60
 MAX_CONSECUTIVE_WRITE_ERRORS = 5
 PREFER_TEXT = 'outlook.body-content-type="text"'
+# Mail and attachments: one Prefer header, comma-separated. ImmutableId keeps
+# `id` stable when a person files a message into another folder.
+PREFER_MAIL = 'outlook.body-content-type="text", IdType="ImmutableId"'
+MAIL_OVERLAP = timedelta(minutes=10)      # each run re-reads from mark - 10 min
+MAX_PAGE_TOP = 1000                       # Graph's $top ceiling for messages
+WRITE_FAILURES_BEFORE_SKIP = 3
+EXCLUDED_KEEP_DAYS = 7
+EXCLUDED_KEEP_MAX = 200
+EXCLUDED_CHECK_PER_RUN = 50
+STALE_TMP_SECONDS = 30 * 60
+_TMP_NAME_RE = re.compile(r"^\..+\.\d+\.tmp$")
 
 MAIL_SELECT = ",".join([
-    "id", "conversationId", "parentFolderId", "subject", "from", "sender",
+    "id", "internetMessageId", "conversationId", "parentFolderId", "subject", "from", "sender",
     "toRecipients", "ccRecipients", "receivedDateTime", "hasAttachments", "body",
+])
+MEETING_SELECT = ",".join([
+    "id", "subject", "organizer", "attendees", "start", "end", "isAllDay", "isCancelled",
+    "isOnlineMeeting", "onlineMeeting", "onlineMeetingProvider",
 ])
 CALENDAR_SELECT = ",".join([
     "id", "subject", "body", "bodyPreview", "organizer", "attendees", "start", "end",
@@ -59,7 +74,9 @@ CALENDAR_SELECT = ",".join([
 ])
 
 INDEX_MAIL = "ids-correo.txt"
+INDEX_MAIL_INTERNET = "ids-correo-internet.txt"
 INDEX_MEETINGS = "ids-reuniones.txt"
+SKIPPED_FILE = "skipped.txt"
 STATE_FILE = "state.json"
 ACCOUNT_FILE = "cuenta.json"
 
@@ -95,6 +112,27 @@ class GraphError(Exception):
         return f"{self.status} {self.inner_code or self.code}".strip()
 
 
+def _network_errors() -> tuple[type[BaseException], ...]:
+    import http.client
+    import socket
+    import urllib.error
+    return (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException)
+
+
+NETWORK_ERRORS = _network_errors()
+
+
+def describe_error(exc: BaseException) -> str:
+    """Class plus a short, non-personal reason (never a message body or URL)."""
+    if isinstance(exc, GraphError):
+        return f"Graph {exc.motive()}"
+    if isinstance(exc, NETWORK_ERRORS):
+        return f"red ({type(exc).__name__})"
+    if isinstance(exc, OSError):
+        return f"disco ({type(exc).__name__})"
+    return type(exc).__name__
+
+
 @dataclass
 class ProfileSettings:
     slug: str
@@ -106,6 +144,7 @@ class ProfileSettings:
     mail_exclude_folders: list[str] = field(default_factory=lambda: ["junkemail", "deleteditems", "drafts"])
     max_messages_per_run: int = 1000
     teams: bool = False
+    meetings_lookback_days: int = 7
 
 
 @dataclass
@@ -533,6 +572,13 @@ class ProfileRun:
         self.cuenta = ""
         self.folder_cache: dict[str, dict[str, Any]] = {}
         self.events: list[dict[str, Any]] | None = None
+        self.session_confirmed = False
+        self.mail_index: set[str] = set()
+        self.internet_index: set[str] = set()
+        self.skipped: set[str] = set()
+        self.excluded_state: dict[str, dict[str, Any]] = {}
+        self.excluded_ids: set[str] = set()
+        self.excluded_new: set[str] = set()
 
     # -- helpers ------------------------------------------------------------
 
@@ -578,43 +624,95 @@ class ProfileRun:
         cached = load_json(self.profile_dir / ACCOUNT_FILE).get("cuenta")
         if cached:
             return str(cached)
-        me = self.graph.get_json(odata_url(f"{self.graph.base}/me", {"$select": "userPrincipalName,mail"}))
+        try:
+            me = self.graph.get_json(odata_url(f"{self.graph.base}/me", {"$select": "userPrincipalName,mail"}))
+        except GraphError as exc:
+            if exc.status == 401:
+                raise NeedsLogin("Microsoft rechazó la sesión (401 en /me)") from None
+            raise
+        self.session_confirmed = True
         cuenta = str(me.get("userPrincipalName") or me.get("mail") or "")
         if cuenta and not self.dry_run:
             save_json(self.profile_dir / ACCOUNT_FILE, {"cuenta": cuenta, "desde": self.ingestado})
         return cuenta
 
+    def empresa(self) -> str:
+        """Single source for both the `<empresa>` folder and the frontmatter."""
+        value = self.s.empresa
+        if not value or not EMPRESA_RE.fullmatch(value):
+            raise ValueError("empresa vacía o inválida: no se escribe ningún crudo sin empresa")
+        return value
+
+    def confirm_session(self) -> None:
+        """A 401 on one resource is only a dead session if /me fails too."""
+        if self.session_confirmed:
+            return
+        try:
+            self.graph.get_json(odata_url(f"{self.graph.base}/me", {"$select": "id"}))
+        except GraphError as exc:
+            if exc.status == 401:
+                raise NeedsLogin("Microsoft rechazó la sesión (401 en /me)") from None
+            raise
+        self.session_confirmed = True
+
+    def cleanup_stale_tmp(self) -> None:
+        """Remove our own leftover `.<name>.<pid>.tmp` files (a crash between
+        write and rename) older than 30 minutes. Nothing else is touched."""
+        if self.dry_run or not self.raw_root.is_dir():
+            return
+        cutoff = time.time() - STALE_TMP_SECONDS
+        for path in self.raw_root.rglob(".*.tmp"):
+            try:
+                if _TMP_NAME_RE.fullmatch(path.name) and path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+
     # -- run ------------------------------------------------------------------
 
     def _stage(self, name: str, action: Callable[[], None]) -> bool:
-        """Run one source; a Graph error in it is recorded and the other
-        sources still run (a calendar 403 must not cost the mail)."""
+        """Run one source. Any failure in it (Graph, network, disk, a bug) is
+        recorded with its class and a short reason, and the other sources
+        still run. Only a confirmed dead session (NeedsLogin) stops the run."""
         try:
             action()
             return True
-        except GraphError as exc:
-            message = f"error: {name} Graph {exc.motive()}"
+        except NeedsLogin:
+            raise
+        except Exception as exc:  # noqa: BLE001 - containment is the point
+            if isinstance(exc, GraphError) and exc.status == 401:
+                self.confirm_session()  # raises NeedsLogin when /me fails too
+            message = f"error: {name} {describe_error(exc)}"
             if self.result.estado == "ok":
                 self.result.estado = message
             else:
                 self.result.notas.append(message)
             self.result.exit_code = max(self.result.exit_code, 1)
+            self.verbose(f"stage {name} failed: {type(exc).__name__}")
             return False
 
     def run(self) -> RunResult:
+        """Mail first (it is what the extraction needs most), then calendar,
+        then meetings."""
         self.cuenta = self.load_account()
-        events_ok = True
-        if "calendar" in self.only or ("meetings" in self.only and self.s.teams):
-            events_ok = self._stage("calendario", self.fetch_events)
-        if "calendar" in self.only and events_ok:
-            self._stage("calendario", self.write_calendar)
-        if "meetings" in self.only and self.s.teams and events_ok:
+        self.cleanup_stale_tmp()
+        if "mail" in self.only:
+            full_deadline = self.deadline
+            slot = full_deadline - time.monotonic()
+            if self.s.teams and "meetings" in self.only and slot > 0:
+                self.deadline = full_deadline - 0.2 * slot  # leave time for meetings
+            try:
+                self._stage("correo", self.sync_mail)
+            finally:
+                self.deadline = full_deadline
+        if "calendar" in self.only:
+            if self._stage("calendario", self.fetch_events):
+                self._stage("calendario", self.write_calendar)
+        if "meetings" in self.only and self.s.teams:
             if self.time_left() > 0:
                 self._stage("reuniones", self.sync_meetings)
             else:
                 self.result.reuniones_nota = "pendiente, continúa en la siguiente"
-        if "mail" in self.only:
-            self._stage("correo", self.sync_mail)
         return self.result
 
     # -- mail -----------------------------------------------------------------
@@ -629,7 +727,7 @@ class ProfileRun:
                 data = self.graph.get_json(odata_url(
                     f"{self.graph.base}/me/mailFolders/{urllib.parse.quote(name, safe='')}",
                     {"$select": "id,displayName"},
-                ))
+                ), prefer=PREFER_MAIL)
             except GraphError as exc:
                 if exc.status in (400, 404):
                     self.verbose(f"carpeta excluida {name!r} no existe en este buzón")
@@ -640,6 +738,8 @@ class ProfileRun:
         return excluded
 
     def folder_info(self, folder_id: str) -> dict[str, Any]:
+        """Folder name and parent; {} when Graph cannot tell (contained per
+        message: the mail is still written, with an empty `carpeta`)."""
         if folder_id in self.folder_cache:
             return self.folder_cache[folder_id]
         info: dict[str, Any] = {}
@@ -647,10 +747,15 @@ class ProfileRun:
             info = self.graph.get_json(odata_url(
                 f"{self.graph.base}/me/mailFolders/{urllib.parse.quote(folder_id, safe='')}",
                 {"$select": "id,displayName,parentFolderId"},
-            ))
+            ), prefer=PREFER_MAIL)
+        except NeedsLogin:
+            raise
         except GraphError as exc:
-            if exc.status not in (400, 403, 404):
-                raise
+            if exc.status == 401:
+                self.confirm_session()
+            self.verbose(f"carpeta sin datos: {describe_error(exc)}")
+        except NETWORK_ERRORS as exc:
+            self.verbose(f"carpeta sin datos: {describe_error(exc)}")
         self.folder_cache[folder_id] = info
         return info
 
@@ -677,21 +782,37 @@ class ProfileRun:
         items: list[dict[str, Any]] = []
         pages = 0
         while url and pages < 5:
-            data = self.graph.get_json(url)
+            data = self.graph.get_json(url, prefer=PREFER_MAIL)
             items.extend(data.get("value") or [])
             url = data.get("@odata.nextLink")
             pages += 1
         return items
 
-    def empresa(self) -> str:
-        """Single source for both the `<empresa>` folder and the frontmatter."""
-        value = self.s.empresa
-        if not value or not EMPRESA_RE.fullmatch(value):
-            raise ValueError("empresa vacía o inválida: no se escribe ningún crudo sin empresa")
-        return value
+    def safe_attachments(self, message_id: str) -> tuple[list[dict[str, Any]], bool]:
+        """Attachment metadata; on failure ([], True) so one message with a
+        broken attachment list never blocks the mailbox."""
+        try:
+            return self.attachments(message_id), False
+        except NeedsLogin:
+            raise
+        except GraphError as exc:
+            if exc.status == 401:
+                self.confirm_session()
+            self.verbose(f"adjuntos sin datos: {describe_error(exc)}")
+        except NETWORK_ERRORS as exc:
+            self.verbose(f"adjuntos sin datos: {describe_error(exc)}")
+        return [], True
 
-    def render_mail(self, msg: dict[str, Any], received: datetime, attachments: list[dict[str, Any]], carpeta: str) -> str:
-        sender = person(msg.get("from") or msg.get("sender"))
+    def render_mail(
+        self,
+        msg: dict[str, Any],
+        received: datetime,
+        attachments: list[dict[str, Any]],
+        carpeta: str,
+        attachments_error: bool = False,
+    ) -> str:
+        # Sender first; `from` without an address falls back to `sender`.
+        sender = person(msg.get("from")) or person(msg.get("sender"))
         people = unique_people(
             [sender]
             + [person(p) for p in msg.get("toRecipients") or []]
@@ -701,16 +822,18 @@ class ProfileRun:
         lines = [
             "---",
             "fuente: correo",
-            f"empresa: {self.empresa()}",
+            f"empresa: {yaml_quote(self.empresa())}",
             f"cuenta: {yaml_quote(self.cuenta)}",
             f"fecha: {local_iso(received)}",
             f"id_origen: {yaml_quote(msg.get('id') or '')}",
+            f"id_internet: {yaml_quote(msg.get('internetMessageId') or '')}",
             *yaml_list("participantes", people),
             f"asunto: {yaml_quote(msg.get('subject') or '')}",
             "proyecto:",
             f"carpeta: {yaml_quote(carpeta)}",
             f"hilo: {yaml_quote(msg.get('conversationId') or '')}",
             *yaml_list("adjuntos", names),
+            *(["adjuntos_error: true"] if attachments_error else []),
             f"ingestado: {self.ingestado}",
             "---",
             "",
@@ -724,6 +847,11 @@ class ProfileRun:
                 size_text = f"{max(1, round(int(size) / 1024))} KB" if isinstance(size, (int, float)) else "tamaño desconocido"
                 lines.append(f"- {name} ({kind}, {size_text})")
             lines.append("")
+        elif attachments_error:
+            lines.append("## Adjuntos")
+            lines.append("")
+            lines.append("- (no se pudo leer la lista de adjuntos)")
+            lines.append("")
         text = neutralize_rules(body_text(msg).strip("\n"))
         text, truncated = truncate_utf8(text, MAIL_BODY_MAX_BYTES)
         lines.append("## Cuerpo")
@@ -734,15 +862,44 @@ class ProfileRun:
             lines.append(MAIL_TRUNCATED_MARKER)
         return "\n".join(lines).rstrip("\n") + "\n"
 
-    def write_message(self, msg: dict[str, Any], index: set[str], index_path: Path, excluded: set[str]) -> str:
+    def is_known(self, msg: dict[str, Any]) -> bool:
+        """Already written, recorded by internetMessageId, skipped, or a known
+        excluded message: re-reading it costs nothing (no cap, no budget)."""
+        message_id = str(msg.get("id") or "")
+        internet_id = str(msg.get("internetMessageId") or "")
+        return (
+            message_id in self.mail_index
+            or message_id in self.skipped
+            or message_id in self.excluded_ids
+            or (bool(internet_id) and internet_id in self.internet_index)
+        )
+
+    def record_written(self, message_id: str, internet_id: str) -> None:
+        if not self.dry_run:
+            append_index(self.profile_dir / INDEX_MAIL, message_id)
+            if internet_id:
+                append_index(self.profile_dir / INDEX_MAIL_INTERNET, internet_id)
+        self.mail_index.add(message_id)
+        if internet_id:
+            self.internet_index.add(internet_id)
+
+    def write_message(self, msg: dict[str, Any], excluded: set[str]) -> str:
         """Returns 'written', 'known', 'excluded' or 'skipped'."""
         message_id = str(msg.get("id") or "")
+        internet_id = one_line(msg.get("internetMessageId"))
         if not message_id:
             return "skipped"
-        if message_id in index:
+        if self.is_known(msg) and message_id not in self.excluded_ids:
+            if message_id not in self.mail_index and internet_id in self.internet_index:
+                # Same message under another id (a copy, or an id recorded before
+                # ImmutableId): never a second file; remember this id too.
+                if not self.dry_run:
+                    append_index(self.profile_dir / INDEX_MAIL, message_id)
+                self.mail_index.add(message_id)
             return "known"
         folder_id = str(msg.get("parentFolderId") or "")
         if folder_id and self.is_excluded(folder_id, excluded):
+            self.remember_excluded(message_id)
             return "excluded"
         received = parse_graph_datetime(msg.get("receivedDateTime"))
         if received is None:
@@ -752,27 +909,86 @@ class ProfileRun:
         stem = f"{local.strftime('%H%M')}-{slugify(msg.get('subject'))}"
         path, already = self.choose_path(directory, stem, ".md", message_id)
         if already:
-            if not self.dry_run:
-                append_index(index_path, message_id)
-            index.add(message_id)
+            self.record_written(message_id, internet_id)
             return "known"
-        attachments = self.attachments(message_id) if msg.get("hasAttachments") else []
+        attachments, attachments_error = (
+            self.safe_attachments(message_id) if msg.get("hasAttachments") else ([], False)
+        )
         carpeta = one_line(self.folder_info(folder_id).get("displayName")) if folder_id else ""
-        content = self.render_mail(msg, received, attachments, carpeta)
+        content = self.render_mail(msg, received, attachments, carpeta, attachments_error)
         if self.dry_run:
             self.plan(path, "correo")
         else:
             atomic_write_text(path, content)
-            append_index(index_path, message_id)
-        index.add(message_id)
+        self.record_written(message_id, internet_id)
+        self.forget_excluded(message_id)
         return "written"
 
-    def sync_mail(self) -> None:
-        """Whole mailbox (minus excluded folders) by receivedDateTime watermark.
+    # excluded messages are remembered for a while: a message rescued from
+    # Junk or Deleted Items keeps its immutable id and is written then.
 
-        The watermark only advances through the contiguous prefix of messages
-        handled successfully, and is saved even when the run stops early
-        (time budget, cap, Graph error), so the next run continues from there.
+    def remember_excluded(self, message_id: str) -> None:
+        if message_id not in self.excluded_state:
+            self.excluded_state[message_id] = {"desde": self.ingestado, "revisado": self.ingestado}
+            self.excluded_ids.add(message_id)
+            self.excluded_new.add(message_id)  # just seen excluded: no re-check this run
+
+    def forget_excluded(self, message_id: str) -> None:
+        self.excluded_state.pop(message_id, None)
+        self.excluded_ids.discard(message_id)
+
+    def prune_excluded(self) -> None:
+        cutoff = self.run_at - timedelta(days=EXCLUDED_KEEP_DAYS)
+        for message_id, info in list(self.excluded_state.items()):
+            since = parse_graph_datetime((info or {}).get("desde"))
+            if since is None or since < cutoff:
+                self.forget_excluded(message_id)
+        if len(self.excluded_state) > EXCLUDED_KEEP_MAX:
+            ordered = sorted(self.excluded_state.items(), key=lambda kv: str((kv[1] or {}).get("desde") or ""))
+            for message_id, _ in ordered[: len(self.excluded_state) - EXCLUDED_KEEP_MAX]:
+                self.forget_excluded(message_id)
+
+    def rescue_excluded(self, excluded: set[str]) -> None:
+        """Re-check up to 50 remembered excluded messages (least recently
+        checked first). One that now sits in a normal folder is written."""
+        candidates = sorted(
+            ((k, v) for k, v in self.excluded_state.items() if k not in self.excluded_new),
+            key=lambda kv: str((kv[1] or {}).get("revisado") or ""),
+        )[:EXCLUDED_CHECK_PER_RUN]
+        for message_id, info in candidates:
+            if self.time_left() <= 0:
+                break
+            try:
+                msg = self.graph.get_json(odata_url(
+                    f"{self.graph.base}/me/messages/{urllib.parse.quote(message_id, safe='')}",
+                    {"$select": MAIL_SELECT},
+                ), prefer=PREFER_MAIL)
+            except GraphError as exc:
+                if exc.status in (400, 404):
+                    self.forget_excluded(message_id)  # gone for good
+                    continue
+                if exc.status == 401:
+                    self.confirm_session()
+                break  # transient: try again next run
+            except NETWORK_ERRORS:
+                break
+            folder_id = str(msg.get("parentFolderId") or "")
+            if folder_id and self.is_excluded(folder_id, excluded):
+                info["revisado"] = self.ingestado
+                continue
+            self.forget_excluded(message_id)
+            if self.write_message(msg, excluded) == "written":
+                self.result.correo_nuevos += 1
+
+    def sync_mail(self) -> None:
+        """Whole mailbox (minus excluded folders) by receivedDateTime.
+
+        Keyset pagination: every page is a fresh `receivedDateTime ge <last
+        seen>` query instead of a `$skip` nextLink, so items leaving the result
+        set mid-run cannot shift offsets and hide others. Each run starts at
+        mark - 10 min; re-reads of known ids are free (no cap, no budget).
+        The watermark only advances through the contiguous prefix of handled
+        messages and is saved even when the run stops early.
         """
         state_path = self.profile_dir / STATE_FILE
         state = load_json(state_path)
@@ -780,60 +996,111 @@ class ProfileRun:
         mark = str(mail_state.get("marca") or "")
         if not mark:
             mark = iso_z(datetime.now(timezone.utc) - timedelta(days=self.s.backfill_days))
-        index_path = self.profile_dir / INDEX_MAIL
-        index = load_index(index_path)
+        mark_dt = parse_graph_datetime(mark) or (datetime.now(timezone.utc) - timedelta(days=self.s.backfill_days))
+        failures: dict[str, Any] = dict(mail_state.get("fallos") or {}) if isinstance(mail_state.get("fallos"), dict) else {}
+        self.excluded_state = {
+            k: dict(v) for k, v in (mail_state.get("excluidos") or {}).items() if isinstance(v, dict)
+        } if isinstance(mail_state.get("excluidos"), dict) else {}
+        self.excluded_ids = set(self.excluded_state)
+        self.mail_index = load_index(self.profile_dir / INDEX_MAIL)
+        self.internet_index = load_index(self.profile_dir / INDEX_MAIL_INTERNET)
+        self.skipped = {line.split("\t", 1)[0] for line in load_index(self.profile_dir / SKIPPED_FILE)}
         limit = max(1, int(self.s.max_messages_per_run))
-        processed = 0
+        new_work = 0
+        new_mark_dt = mark_dt
         new_mark = mark
         frozen = False
         consecutive_errors = 0
         errors = 0
+        skipped_now = 0
         stop: str | None = None
+        cursor = iso_z(mark_dt - MAIL_OVERLAP)
+        top = PAGE_SIZE
+        seen: set[str] = set()
+        excluded: set[str] = set()
         try:
             excluded = self.resolve_excluded_folders()
-            url: str | None = odata_url(f"{self.graph.base}/me/messages", {
-                "$filter": f"receivedDateTime ge {mark}",
-                "$orderby": "receivedDateTime asc",
-                "$select": MAIL_SELECT,
-                "$top": str(min(PAGE_SIZE, limit)),
-            })
-            while url and not stop:
-                page = self.graph.get_json(url, prefer=PREFER_TEXT)
-                for msg in page.get("value") or []:
-                    if processed >= limit:
+            for _page in range(100000):
+                page = self.graph.get_json(odata_url(f"{self.graph.base}/me/messages", {
+                    "$filter": f"receivedDateTime ge {cursor}",
+                    "$orderby": "receivedDateTime asc",
+                    "$select": MAIL_SELECT,
+                    "$top": str(top),
+                }), prefer=PREFER_MAIL)
+                values = page.get("value") or []
+                for msg in values:
+                    message_id = str(msg.get("id") or "")
+                    if not message_id or message_id in seen:
+                        continue
+                    seen.add(message_id)
+                    free = self.is_known(msg)
+                    if not free and new_work >= limit:
                         stop = "tope"
                         break
-                    processed += 1
                     try:
-                        outcome = self.write_message(msg, index, index_path, excluded)
+                        outcome = self.write_message(msg, excluded)
                         consecutive_errors = 0
-                    except OSError as exc:
+                        failures.pop(message_id, None)
+                    except NeedsLogin:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - one message must not stall the mailbox
                         errors += 1
                         consecutive_errors += 1
-                        frozen = True
-                        self.verbose(f"no se pudo escribir un correo: {type(exc).__name__}: {exc}")
-                        if consecutive_errors >= MAX_CONSECUTIVE_WRITE_ERRORS:
-                            stop = "errores"
-                            break
-                        continue
+                        reason = describe_error(exc)
+                        entry = failures.get(message_id) if isinstance(failures.get(message_id), dict) else {}
+                        count = int(entry.get("n", 0)) + 1
+                        self.verbose(f"no se pudo escribir un correo ({count}/{WRITE_FAILURES_BEFORE_SKIP}): {reason}")
+                        if count >= WRITE_FAILURES_BEFORE_SKIP:
+                            failures.pop(message_id, None)
+                            self.skipped.add(message_id)
+                            skipped_now += 1
+                            if not self.dry_run:
+                                append_index(self.profile_dir / SKIPPED_FILE,
+                                             f"{message_id}\t{self.ingestado}\t{reason}")
+                            outcome = "skipped"
+                        else:
+                            failures[message_id] = {"n": count, "motivo": reason}
+                            frozen = True
+                            if consecutive_errors >= MAX_CONSECUTIVE_WRITE_ERRORS:
+                                stop = "errores"
+                                break
+                            continue
                     if outcome == "written":
                         self.result.correo_nuevos += 1
-                    if not frozen and msg.get("receivedDateTime"):
+                    if not free:
+                        new_work += 1
+                    received = parse_graph_datetime(msg.get("receivedDateTime"))
+                    if not frozen and received is not None and received > new_mark_dt:
+                        new_mark_dt = received
                         new_mark = str(msg["receivedDateTime"])
-                    if self.time_left() <= 0:
+                    if not free and self.time_left() <= 0:
                         stop = "tiempo"
                         break
-                if stop:
+                if stop or not values or not page.get("@odata.nextLink"):
                     break
-                url = page.get("@odata.nextLink")
-                if url and processed >= limit:
-                    stop = "tope"
+                last = str(values[-1].get("receivedDateTime") or "")
+                if last and last != cursor:
+                    cursor, top = last, PAGE_SIZE
+                elif top < MAX_PAGE_TOP:
+                    top = min(MAX_PAGE_TOP, top * 4)  # a tie group bigger than the page
+                else:
+                    last_dt = parse_graph_datetime(last)
+                    if last_dt is None:
+                        break
+                    cursor, top = iso_z(last_dt + timedelta(seconds=1)), PAGE_SIZE
+                    self.result.notas.append("más de 1000 correos en el mismo segundo; se avanzó 1 s")
+            if not stop and self.time_left() > 0:
+                self.rescue_excluded(excluded)
+            self.prune_excluded()
         finally:
-            if not self.dry_run and new_mark != mark:
+            if not self.dry_run:
                 state = load_json(state_path)
                 correo = state.get("correo") if isinstance(state.get("correo"), dict) else {}
-                correo["marca"] = new_mark
+                if new_mark != mark:
+                    correo["marca"] = new_mark
                 correo["actualizado"] = self.ingestado
+                correo["fallos"] = failures
+                correo["excluidos"] = self.excluded_state
                 state["correo"] = correo
                 state["version"] = 1
                 save_json(state_path, state)
@@ -841,8 +1108,10 @@ class ProfileRun:
             self.result.notas.append(f"tope de {limit} mensajes alcanzado, continúa en la siguiente")
         elif stop == "tiempo":
             self.result.notas.append("tope de tiempo alcanzado, continúa en la siguiente")
-        if errors:
-            self.result.estado = f"error: {errors} correos sin escribir"
+        if skipped_now:
+            self.result.notas.append(f"{skipped_now} correos omitidos tras {WRITE_FAILURES_BEFORE_SKIP} fallos (ver skipped.txt)")
+        if errors - skipped_now > 0:
+            self.result.estado = f"error: {errors - skipped_now} correos sin escribir"
             self.result.exit_code = max(self.result.exit_code, 1)
 
     # -- calendar -------------------------------------------------------------
@@ -945,7 +1214,7 @@ class ProfileRun:
         lines = [
             "---",
             "fuente: calendario",
-            f"empresa: {self.empresa()}",
+            f"empresa: {yaml_quote(self.empresa())}",
             f"cuenta: {yaml_quote(self.cuenta)}",
             f"fecha: {local_iso(local_midnight(day))}",
             *yaml_list("id_origen", [str(ev.get("id") or "") for ev in ordered]),
@@ -994,16 +1263,37 @@ class ProfileRun:
 
     # -- meetings -------------------------------------------------------------
 
+    def fetch_meeting_events(self) -> list[dict[str, Any]]:
+        """Past online meetings over their own lookback (default 7 days), so
+        Friday's transcript is still fetched on Monday. ids-reuniones.txt
+        dedups, so re-reading the window every run is free."""
+        start = local_midnight(self.run_at.date() - timedelta(days=self.s.meetings_lookback_days))
+        url: str | None = odata_url(f"{self.graph.base}/me/calendarView", {
+            "startDateTime": iso_z(start),
+            "endDateTime": iso_z(datetime.now(timezone.utc)),
+            "$top": str(PAGE_SIZE),
+            "$orderby": "start/dateTime",
+            "$select": MEETING_SELECT,
+        })
+        events: list[dict[str, Any]] = []
+        pages = 0
+        while url and pages < CALENDAR_MAX_PAGES:
+            data = self.graph.get_json(url)
+            events.extend(data.get("value") or [])
+            url = data.get("@odata.nextLink")
+            pages += 1
+        return events
+
     def sync_meetings(self) -> None:
         """Teams transcripts, following docs/teams-transcripts-research.md:
         JoinWebUrl -> onlineMeeting id -> transcripts -> content (text/vtt,
         falling back to the unattributed format on SpeakerAttributionNotAllowed).
-        A 403 is logged with its code and never stops mail or calendar."""
+        A 403 is logged with its code and never stops mail or calendar; a 401
+        on one meeting is only a dead session when /me fails too."""
         now = datetime.now(timezone.utc)
-        window_start = local_midnight(self.window_days()[0])
-        cutoff = now - timedelta(days=max(self.s.backfill_days, self.s.calendar_past_days + 1))
+        window_start = local_midnight(self.run_at.date() - timedelta(days=self.s.meetings_lookback_days))
         candidates = []
-        for ev in self.events or []:
+        for ev in self.fetch_meeting_events():
             if not self.is_teams(ev) or ev.get("isCancelled"):
                 continue
             start, end = self.event_bounds(ev)
@@ -1015,6 +1305,18 @@ class ProfileRun:
         forbidden: str | None = None
         not_found = 0
         seen_meetings: set[str] = set()
+
+        def refused(exc: GraphError) -> bool:
+            """403/401 on one meeting: note it and move on (401 only after /me
+            proved the session is alive)."""
+            nonlocal forbidden
+            if exc.status == 401:
+                self.confirm_session()
+            if exc.status in (401, 403):
+                forbidden = forbidden or exc.motive()
+                return True
+            return False
+
         for ev in candidates:
             if self.time_left() <= 0:
                 self.result.notas.append("reuniones pendientes, continúa en la siguiente")
@@ -1032,8 +1334,7 @@ class ProfileRun:
                     f"{self.graph.base}/me/onlineMeetings/{urllib.parse.quote(meeting_id, safe='')}/transcripts"
                 ).get("value") or []
             except GraphError as exc:
-                if exc.status == 403:
-                    forbidden = forbidden or exc.motive()
+                if refused(exc):
                     if exc.has("GraphAccessToTranscriptsDisabled"):
                         break  # tenant-wide switch: every other meeting fails the same way
                     continue
@@ -1045,15 +1346,12 @@ class ProfileRun:
                 if not tid or tid in index:
                     continue
                 created = parse_graph_datetime(transcript.get("createdDateTime"))
-                if created is not None and created < cutoff:
+                if created is not None and created < window_start:
                     continue
                 try:
                     vtt, attributed = self.transcript_content(meeting_id, tid)
                 except GraphError as exc:
-                    if exc.status == 403:
-                        forbidden = forbidden or exc.motive()
-                        continue
-                    if exc.status == 404:
+                    if refused(exc) or exc.status == 404:
                         continue
                     raise
                 if self.write_meeting(ev, transcript, vtt, index, index_path, attributed):
@@ -1113,7 +1411,7 @@ class ProfileRun:
         lines = [
             "---",
             "fuente: reunion",
-            f"empresa: {self.empresa()}",
+            f"empresa: {yaml_quote(self.empresa())}",
             f"cuenta: {yaml_quote(self.cuenta)}",
             f"fecha: {local_iso(started)}",
             f"id_origen: {yaml_quote(tid)}",

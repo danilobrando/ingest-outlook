@@ -382,7 +382,7 @@ class SyncTests(unittest.TestCase):
             message_requests = [p for m, p in server.paths if p.startswith("/me/messages?")]
             self.assertTrue(message_requests)
             self.assertIn("receivedDateTime%20asc", message_requests[0])
-            self.assertIn('outlook.body-content-type="text"', server.prefers)
+            self.assertIn('outlook.body-content-type="text", IdType="ImmutableId"', server.prefers)
             self.assertTrue(any("/attachments?$select=name,contentType,size" in p for _, p in server.paths))
             lines = env.log_lines()
             self.assertEqual(len(lines), 1)
@@ -417,7 +417,8 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertEqual(snapshot(env.mail_dir()), before)
             query = next(p for _, p in server.paths if p.startswith("/me/messages?"))
-            self.assertIn(state["correo"]["marca"].replace(":", ":"), query.replace("%3A", ":"))
+            overlap = (sync_cerebro.parse_graph_datetime(state["correo"]["marca"]) - timedelta(minutes=10))
+            self.assertIn(sync_cerebro.iso_z(overlap), query.replace("%3A", ":"))  # re-reads from mark - 10 min
             self.assertIn("correo 0 nuevos", env.log_lines()[-1])
             self.assertEqual(len((env.config / "acme" / "ids-correo.txt").read_text(encoding="utf-8").split()), 3)
 

@@ -52,11 +52,13 @@ __license__ = "MIT"
 import argparse
 import base64
 import hashlib
+import http.client
 import http.server
 import json
 import os
 import re
 import secrets
+import socket
 import socketserver
 import sys
 import threading
@@ -159,7 +161,24 @@ EXIT_NEEDS_LOGIN = 4
 
 MESSAGE_LIMIT = 50            # max items per Graph page
 MAX_PAGES = 4                 # cap on pagination (default 200 items max per fetch)
-HTTP_TIMEOUT = 30
+def _env_timeout(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+HTTP_TIMEOUT = _env_timeout("INGEST_OUTLOOK_HTTP_TIMEOUT", 30)
+# Transient transport failures retried like URLError. socket.timeout is
+# TimeoutError on 3.10+, but the name keeps older semantics explicit.
+NETWORK_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+    http.client.HTTPException,
+)
 MAX_RETRIES = 3
 TIME_SKEW_WARN_SECONDS = 60
 TOKEN_FRESHNESS_BUFFER = 300  # require >5 min remaining; force prophylactic refresh otherwise
@@ -466,7 +485,9 @@ class Config:
         mail_exclude_folders: list[str] | None = None,
         max_messages_per_run: int = 1000,
         profile: str | None = None,
+        meetings_lookback_days: int = 7,
     ):
+        self.meetings_lookback_days = meetings_lookback_days
         self.layout = layout
         self.empresa = empresa
         self.raw_root = raw_root
@@ -662,6 +683,7 @@ def load_config(
         "calendar_ahead_days": (None, 14),
         "mail_exclude_folders": (None, list(DEFAULT_EXCLUDED_FOLDERS)),
         "max_messages_per_run": (None, 1000),
+        "meetings_lookback_days": (None, 7),
     }
     values: dict[str, Any] = {}
     sources: dict[str, str] = {}
@@ -682,6 +704,7 @@ def load_config(
     calendar_past_days = _int_in_range(values["calendar_past_days"], "calendar_past_days", 0, 60)
     calendar_ahead_days = _int_in_range(values["calendar_ahead_days"], "calendar_ahead_days", 0, 60)
     max_messages = _int_in_range(values["max_messages_per_run"], "max_messages_per_run", 1, 100000)
+    meetings_lookback = _int_in_range(values["meetings_lookback_days"], "meetings_lookback_days", 1, 60)
     exclude_folders = _folder_list(values["mail_exclude_folders"])
 
     client_id = str(values["client_id"] or "").strip()
@@ -761,6 +784,7 @@ def load_config(
         mail_exclude_folders=exclude_folders,
         max_messages_per_run=max_messages,
         profile=_active_profile,
+        meetings_lookback_days=meetings_lookback,
     )
     GRAPH_BASE = cfg.graph_base
     AUTHORITY_BASE = cfg.authority_base
@@ -1236,9 +1260,11 @@ def _graph_request(
                 except Exception as refresh_err:
                     _verbose(f"mid-run refresh failed: {refresh_err}")
             raise
-        except urllib.error.URLError as e:
+        except NETWORK_ERRORS as e:
             last_err = e
-            time.sleep(2 ** attempt)
+            _verbose(f"network error on GET ({type(e).__name__}); attempt {attempt + 1}/{MAX_RETRIES}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
     if last_err:
         raise last_err
     raise RuntimeError("graph request exhausted retries without an error object")
@@ -1890,6 +1916,7 @@ def _show_effective_config(cfg: Config) -> None:
         "calendar_ahead_days": cfg.calendar_ahead_days,
         "mail_exclude_folders": cfg.mail_exclude_folders,
         "max_messages_per_run": cfg.max_messages_per_run,
+        "meetings_lookback_days": cfg.meetings_lookback_days,
     }
     print(f"Profile: {_active_profile or '(none)'}")
     print(f"Config file: {CONFIG_PATH}")
@@ -1939,6 +1966,10 @@ def cmd_configure(args: argparse.Namespace) -> int:
     if args.max_messages_per_run is not None:
         updates["max_messages_per_run"] = _int_in_range(
             args.max_messages_per_run, "max_messages_per_run", 1, 100000
+        )
+    if args.meetings_lookback_days is not None:
+        updates["meetings_lookback_days"] = _int_in_range(
+            args.meetings_lookback_days, "meetings_lookback_days", 1, 60
         )
 
     if updates:
@@ -2452,8 +2483,9 @@ class _SyncGraph:
                 except (ValueError, AttributeError):
                     pass
                 _verbose(f"Graph {e.code} {inner or code} on {url}")
-                if e.code == 401:
-                    raise sync_cerebro.NeedsLogin("Microsoft rechazó la sesión (401)") from None
+                # A 401 is reported as a GraphError: sync_cerebro decides whether
+                # it means "sign in again" by checking /me (a 401 on a single
+                # sub-resource, such as one transcript, is not a dead session).
                 if e.code in (500, 502, 503, 504) and attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
@@ -2612,6 +2644,7 @@ def _sync_one(
         mail_exclude_folders=cfg.mail_exclude_folders,
         max_messages_per_run=cfg.max_messages_per_run,
         teams=cfg.teams,
+        meetings_lookback_days=cfg.meetings_lookback_days,
     )
     fix_hint = f"fix --profile {profile}" if profile else "fix"
     runner: sync_cerebro.ProfileRun | None = None
@@ -2639,9 +2672,9 @@ def _sync_one(
         result = runner.result if runner else result
         result.estado = f"error: servidor de inicio de sesión HTTP {exc.code}"
         result.exit_code = 1
-    except urllib.error.URLError:
+    except NETWORK_ERRORS as exc:
         result = runner.result if runner else result
-        result.estado = "error: sin conexión con Microsoft"
+        result.estado = f"error: red, sin conexión con Microsoft ({type(exc).__name__})"
         result.exit_code = 1
     except OSError as exc:
         result = runner.result if runner else result
@@ -2748,6 +2781,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         if conflict:
             print(f"ERROR: {conflict}", file=sys.stderr)
             _log_event("sync", "failure", error_code="lock_path_mismatch", extra={"detail": conflict})
+            if not dry_run:
+                for profile, cfg, _ in members:
+                    line = sync_cerebro.RunResult(
+                        perfil=profile or "-",
+                        estado="error: lock_path no coincide entre perfiles o con .claude/system3/config.json "
+                               "(un solo lock por vault); no se sincronizó",
+                    ).log_line(_now_local_iso())
+                    _append_ingest_log(vault, cfg.ingest_log_path, line)
             worst = max(worst, 2)
             continue
 
@@ -2781,8 +2822,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     print(line)
                 worst = max(worst, result.exit_code)
         finally:
-            if lock is not None:
-                lock.release()
+            if lock is not None and not lock.release():
+                for note in lock_notes[-1:]:
+                    print(f"WARNING: {note}", file=sys.stderr)
+                _log_event("sync", "warning", error_code="lock_release_failed")
 
     _select_profile(original_profile)
     return worst
@@ -3538,6 +3581,8 @@ def main() -> int:
     p_config.add_argument("--mail-exclude-folders", default=None,
                           help="Comma-separated well-known folder names (default junkemail,deleteditems,drafts).")
     p_config.add_argument("--max-messages-per-run", default=None, help="Mail cap per sync run (default 1000).")
+    p_config.add_argument("--meetings-lookback-days", default=None,
+                          help="Days back to look for Teams transcripts (default 7).")
     p_config.add_argument("--show", action="store_true", help="Print effective values and their sources.")
     p_config.set_defaults(func=cmd_configure)
 

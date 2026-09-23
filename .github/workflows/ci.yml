@@ -151,7 +151,7 @@ jobs:
               if ($files.Count -lt 1) { throw "no mail files under $mailDir" }
               foreach ($file in $files) {
                 $text = [System.IO.File]::ReadAllText($file.FullName)
-                if ($text -notmatch "(?m)^empresa: $empresa$") { throw "empresa missing or wrong in $($file.FullName)" }
+                if ($text -notmatch ('(?m)^empresa: "' + $empresa + '"$')) { throw "empresa missing or wrong in $($file.FullName)" }
               }
             }
             $log = [System.IO.Path]::Combine($vault, ".claude", "system3", "logs", "ingesta.log")
