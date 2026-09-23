@@ -12,8 +12,10 @@ Implements the lock agreed in the System 3 v0.2 contract (sections 4 and 7):
   System 3 canonical layout; the vault's `.claude/system3/config.json` may
   declare another `lock_path`), created with an exclusive open (O_CREAT | O_EXCL).
 - Content: JSON {"paso", "perfil", "pid", "inicio", "equipo"}.
-- A lock older than 20 minutes is abandoned: the next process steals it and
-  leaves a note in its own log.
+- A lock older than 20 minutes is abandoned: the next process steals it by
+  renaming it aside (atomic; the same way the extraction's candado.py does),
+  checks that what it moved is the stale lock it judged, and leaves a note in
+  its own log.
 - A lock that is held and still valid is retried for up to 5 minutes; after
   that the caller skips its run (it does not fail).
 - Every process releases it when it finishes, also on error (use the context
@@ -23,11 +25,15 @@ The same module serves ingest-outlook (`fetch.py sync`), the automatic
 extraction and the s3 index, so all three follow identical rules:
 
     python cerebro_lock.py acquire --vault V --paso extraccion [--lock-path P]
-    python cerebro_lock.py release --vault V --paso extraccion [--lock-path P]
+    python cerebro_lock.py release --vault V --paso extraccion --pid N --inicio ISO [--lock-path P]
     python cerebro_lock.py status  --vault V [--lock-path P]
 
+`acquire` prints the lock JSON; pass its `pid` and `inicio` back to `release`,
+which only removes the lock when paso, pid and inicio all match (or --force).
+
 Exit codes: 0 ok, 2 usage error, 3 lock busy (acquire skipped after waiting),
-1 release refused because another process holds the lock.
+1 release refused (another process holds the lock) or the lock file could not
+be removed.
 
 Environment overrides (tests and advanced use): CEREBRO_LOCK_WAIT_SECONDS,
 CEREBRO_LOCK_STALE_SECONDS, CEREBRO_LOCK_POLL_SECONDS.
@@ -44,6 +50,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import socket
 import sys
 import time
@@ -55,7 +62,7 @@ DEFAULT_LOCK_PATH = ".claude/system3/cerebro.lock"
 STALE_SECONDS = 20 * 60
 WAIT_SECONDS = 5 * 60
 POLL_SECONDS = 1.0
-GUARD_STALE_SECONDS = 60
+RELEASE_ATTEMPTS = 10
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -203,7 +210,6 @@ class CerebroLock:
         self.paso = paso
         self.perfil = perfil
         self.path = resolve_lock_path(self.vault, lock_path)
-        self.guard_path = self.path.with_name(self.path.name + ".robo")
         self.pid = int(pid) if pid is not None else os.getpid()
         self.wait_seconds = (
             wait_seconds if wait_seconds is not None
@@ -260,49 +266,65 @@ class CerebroLock:
         age = lock_age_seconds(info, self.path)
         return age is not None and age > self.stale_seconds
 
-    def _steal(self) -> bool:
-        """Replace an abandoned lock. A guard file serialises stealers so two
-        processes can never both remove a lock and then both think they won."""
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    def _side_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.robado.{os.getpid()}.{secrets.token_hex(4)}")
+
+    def _restore(self, side: Path) -> bool:
+        """Put back a lock we moved by mistake, without clobbering a newer one."""
         try:
-            guard_fd = os.open(self.guard_path, flags, 0o644)
-        except (FileExistsError, PermissionError):
+            os.link(side, self.path)  # fails if a lock already exists again
+        except FileExistsError:
+            return False
+        except (OSError, AttributeError, NotImplementedError):
             try:
-                if time.time() - self.guard_path.stat().st_mtime > GUARD_STALE_SECONDS:
-                    self.guard_path.unlink()
+                if self.path.exists():
+                    return False
+                os.rename(side, self.path)
+                return True
+            except OSError:
+                return False
+        try:
+            side.unlink()
+        except OSError:
+            pass
+        return True
+
+    def _steal(self, expected: dict[str, Any]) -> bool:
+        """Steal an abandoned lock atomically: rename it aside, then check that
+        the file moved is the stale lock read before. If another process
+        renewed the lock in between, put theirs back and keep waiting."""
+        side = self._side_path()
+        try:
+            os.replace(self.path, side)
+        except FileNotFoundError:
+            return False  # released or stolen by someone else meanwhile
+        except OSError:
+            return False  # Windows: open by a reader; retry on the next poll
+        moved = read_lock(side)
+        if moved != expected:
+            if not self._restore(side):
+                self.note("al robar el lock se movió uno recién tomado por otro paso y no se pudo devolver")
+            try:
+                side.unlink()
             except OSError:
                 pass
             return False
         try:
-            os.close(guard_fd)
-            current = read_lock(self.path)
-            if current is None:
-                return self._try_create()
-            if not self._is_stale(current):
-                return False
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                return False
-            if not self._try_create():
-                return False
-            self.stolen = current
-            age = lock_age_seconds(current, self.path)
-            self.note(
-                "lock abandonado robado (paso {paso}, inicio {inicio})".format(
-                    paso=describe_holder(current),
-                    inicio=current.get("inicio") or "?",
-                )
-                + (f", tenía {int(age // 60)} min" if age is not None else "")
+            side.unlink()
+        except OSError:
+            pass
+        if not self._try_create():
+            return False
+        self.stolen = expected
+        age = lock_age_seconds(expected, side)
+        self.note(
+            "lock abandonado robado (paso {paso}, inicio {inicio})".format(
+                paso=describe_holder(expected),
+                inicio=expected.get("inicio") or "?",
             )
-            return True
-        finally:
-            try:
-                self.guard_path.unlink()
-            except OSError:
-                pass
+            + (f", tenía {int(age // 60)} min" if age is not None else "")
+        )
+        return True
 
     # -- public API --------------------------------------------------------
 
@@ -314,9 +336,7 @@ class CerebroLock:
                 self.waited_seconds = time.monotonic() - start
                 return True
             current = read_lock(self.path)
-            if current is None:
-                continue  # released between our create and our read
-            if self._is_stale(current) and self._steal():
+            if current is not None and self._is_stale(current) and self._steal(current):
                 self.waited_seconds = time.monotonic() - start
                 return True
             now = time.monotonic()
@@ -324,7 +344,10 @@ class CerebroLock:
                 self.holder = read_lock(self.path) or current
                 self.waited_seconds = now - start
                 return False
-            time.sleep(min(self.poll_seconds, max(0.01, deadline - now)))
+            # A lock that vanished between create and read is retried soon,
+            # but never in a busy loop; the deadline is always honored.
+            pause = 0.05 if current is None else self.poll_seconds
+            time.sleep(min(pause, max(0.01, deadline - now)))
 
     def owns(self, current: dict[str, Any] | None) -> bool:
         if not current or not self.info:
@@ -345,16 +368,21 @@ class CerebroLock:
             self.note("el lock ya no era de este proceso (lo tomó otro paso); no se borra")
             self.info = None
             return False
-        for attempt in range(10):
+        for attempt in range(RELEASE_ATTEMPTS):
             try:
                 self.path.unlink()
-                break
+                self.info = None
+                return True
             except FileNotFoundError:
-                break
-            except PermissionError:
+                self.info = None
+                return True
+            except OSError:
                 time.sleep(0.1 * (attempt + 1))
-        self.info = None
-        return True
+        self.note(
+            f"no se pudo borrar el lock {self.path} al terminar; quedará tomado hasta que "
+            "otro paso lo dé por abandonado (20 min)"
+        )
+        return False
 
     def __enter__(self) -> "CerebroLock":
         if not self.acquire():
@@ -450,9 +478,14 @@ def main(argv: list[str] | None = None) -> int:
     p_acq.add_argument("--stale", type=float, default=None, help="Segundos para darlo por abandonado (default 1200).")
     p_acq.add_argument("--log", default=None, help="Log relativo al vault donde anotar robos y saltos.")
 
-    p_rel = sub.add_parser("release", help="Libera el lock si lo tiene ese paso en este equipo.")
+    p_rel = sub.add_parser(
+        "release",
+        help="Libera el lock si paso, pid e inicio coinciden con los que imprimió acquire.",
+    )
     common(p_rel)
     p_rel.add_argument("--paso", required=True)
+    p_rel.add_argument("--pid", type=int, default=None, help="pid que imprimió acquire.")
+    p_rel.add_argument("--inicio", default=None, help="inicio que imprimió acquire.")
     p_rel.add_argument("--force", action="store_true", help="Borra el lock aunque sea de otro paso o equipo.")
 
     p_st = sub.add_parser("status", help="Muestra el estado del lock en JSON.")
@@ -491,18 +524,35 @@ def main(argv: list[str] | None = None) -> int:
         if current is None:
             print("libre: no había lock")
             return EXIT_OK
-        mine = current.get("paso") == args.paso and current.get("equipo") == _hostname()
+        if not args.force and (args.pid is None or not args.inicio):
+            print("ERROR: release necesita --pid y --inicio (los que imprimió acquire) o --force",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        mine = (
+            current.get("paso") == args.paso
+            and current.get("equipo") == _hostname()
+            and current.get("pid") == args.pid
+            and current.get("inicio") == args.inicio
+        )
         if not mine and not args.force:
             print(
                 f"no se libera: el lock es de {describe_holder(current)} en "
-                f"{current.get('equipo') or '?'} (usa --force si sabes que está abandonado)",
+                f"{current.get('equipo') or '?'} (pid {current.get('pid')}, inicio "
+                f"{current.get('inicio')}); usa --force solo si sabes que está abandonado",
                 file=sys.stderr,
             )
             return EXIT_REFUSED
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        for attempt in range(RELEASE_ATTEMPTS):
+            try:
+                path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                if attempt == RELEASE_ATTEMPTS - 1:
+                    print(f"ERROR: no se pudo borrar el lock {path}: {exc}", file=sys.stderr)
+                    return EXIT_REFUSED
+                time.sleep(0.1 * (attempt + 1))
         print("liberado")
         return EXIT_OK
     except ValueError as exc:

@@ -295,11 +295,13 @@ class CerebroLockTests(unittest.TestCase):
             self.assertIn("saltada: lock ocupado por extraccion", busy.stderr)
             self.assertIn("saltada", (vault / ".claude/system3/logs/s3.log").read_text(encoding="utf-8"))
 
-            refused = self.run_cli("release", "--vault", str(vault), "--paso", "s3")
+            refused = self.run_cli("release", "--vault", str(vault), "--paso", "s3",
+                                   "--pid", str(info["pid"]), "--inicio", info["inicio"])
             self.assertEqual(refused.returncode, 1)
             self.assertTrue((vault / DEFAULT_LOCK).exists())
 
-            released = self.run_cli("release", "--vault", str(vault), "--paso", "extraccion")
+            released = self.run_cli("release", "--vault", str(vault), "--paso", "extraccion",
+                                    "--pid", str(info["pid"]), "--inicio", info["inicio"])
             self.assertEqual(released.returncode, 0, released.stderr)
             self.assertFalse((vault / DEFAULT_LOCK).exists())
 
