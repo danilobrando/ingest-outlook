@@ -22,6 +22,34 @@ If you're installing this for someone else's corporate account, **send them the 
 
 ---
 
+## Corporate tenant, read-only (for the IT admin)
+
+Use this profile when company governance requires the connector to read only the signed-in employee's own mailbox and calendar.
+
+1. In the company's Microsoft Entra tenant, register a **single-tenant** app: "Accounts in this organizational directory only".
+2. Under **Authentication**, add the **Mobile and desktop applications** platform with this redirect URI exactly:
+
+   ```text
+   http://localhost:8765/callback
+   ```
+
+3. Set **Allow public client flows** to **Yes**. Do not create a client secret.
+4. Under **API permissions**, add only these Microsoft Graph **Delegated** permissions:
+
+   - `User.Read`
+   - `Mail.Read`
+   - `Calendars.Read`
+   - `offline_access`
+
+5. Click **Grant admin consent for <tenant>**.
+6. Give users the **Application (client) ID** and **Directory (tenant) ID**. These are public identifiers, not secrets.
+
+Do not add `Mail.Send`, `Calendars.ReadWrite`, `Calendars.Read.Shared`, `OnlineMeetings.Read`, or `OnlineMeetingTranscript.Read.All` for this profile. Shared/delegated mailboxes and calendars are outside its governance boundary. Teams transcripts are also outside the default read-only profile.
+
+If the company operates two separate Entra tenants, register one single-tenant app in each tenant. The alternative is a multitenant app with separate admin consent in every tenant.
+
+---
+
 ## Step-by-step registration
 
 ### 1. Sign in to the Azure portal
@@ -153,18 +181,14 @@ If you're installing this for an employee whose Microsoft 365 tenant is managed 
 >   - User.Read
 >   - offline_access
 >   - Mail.Read
->   - Mail.Send
->   - Calendars.ReadWrite
->   - Calendars.Read.Shared
->   - OnlineMeetings.Read
->   - OnlineMeetingTranscript.Read.All ← requires admin consent
+>   - Calendars.Read
 >
-> Please grant admin consent for the OnlineMeetingTranscript.Read.All permission and share with me the resulting Application (client) ID and Directory (tenant) ID via secure channel.
+> Please grant admin consent for these four delegated permissions and share the resulting Application (client) ID and Directory (tenant) ID with me. These IDs are public identifiers, not secrets.
 >
-> The application is open-source ([repo URL]); it runs entirely on my local machine, stores its OAuth tokens locally at file mode 0600, and never sends data to any third-party server. Every action it takes (read or write) is recorded in a local audit log.
+> The application is open-source ([repo URL]); it runs entirely on my local machine, stores its OAuth tokens in the user's local profile, and never sends data to any third-party server. The local read-only profile blocks write commands before any token or network request.
 >
 > Permissions I am explicitly NOT requesting (to make scope clear):
-> - Mail.ReadWrite, Calendars.ReadWrite.Shared (no editing of others' calendars), Files.Read.All, Sites.Read.All, ChannelMessage.Read.All, Chat.Read, or any Application (vs Delegated) permission.
+> - Mail.Send, Mail.ReadWrite, Calendars.ReadWrite, Calendars.Read.Shared, Calendars.ReadWrite.Shared, OnlineMeetings.Read, OnlineMeetingTranscript.Read.All, Files.Read.All, Sites.Read.All, ChannelMessage.Read.All, Chat.Read, or any Application (vs Delegated) permission.
 
 ---
 

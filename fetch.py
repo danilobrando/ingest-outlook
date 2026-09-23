@@ -16,29 +16,28 @@ Auth:
   on http://localhost:<INGEST_OUTLOOK_REDIRECT_PORT>/callback (default 8765).
   No client secret required.
 
-Config (env vars):
-  MS_GRAPH_CLIENT_ID            (required) Azure app Application (client) ID
+Config (`fetch.py configure` or env vars):
+  MS_GRAPH_CLIENT_ID            Azure app Application (client) ID
   MS_GRAPH_TENANT_ID            (optional, default "common") Azure tenant:
                                   - "common": personal + work/school accounts
                                   - "consumers": personal MS accounts only
                                   - "<tenant-guid>": single-tenant corporate
-  MS_GRAPH_SCOPES               (optional) Space-separated scope list. If
-                                unset, uses DEFAULT_PERSONAL_SCOPES for
-                                tenants "common" or "consumers", and
-                                DEFAULT_CORPORATE_SCOPES for any other
-                                tenant id.
+  MS_GRAPH_SCOPES               (optional) Explicit space-separated scopes
+  INGEST_OUTLOOK_READ_ONLY      (optional) Enable the read-only profile
+  INGEST_OUTLOOK_VAULT_ROOT     (optional) Default vault path
+  INGEST_OUTLOOK_OUTPUT_DIR     (optional) Relative output prefix in vault
   INGEST_OUTLOOK_REDIRECT_PORT  (optional, default 8765) OAuth loopback port
 
 Output: JSON payload on stdout in the shape ingest.py expects.
 
-Token cache: ~/.config/ingest-outlook/token.json (mode 0600).
+State defaults to ~/.config/ingest-outlook (POSIX mode 0600 files; Windows ACL).
 
 Stdlib only. No external dependencies.
 """
 from __future__ import annotations
 
 __author__ = "Danny Bravo"
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __license__ = "MIT"
 
 import argparse
@@ -47,6 +46,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import secrets
 import socketserver
 import sys
@@ -56,16 +56,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
+from datetime import datetime, time as datetime_time, timedelta, timezone
+from pathlib import Path, PureWindowsPath
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Constants and config
 # ---------------------------------------------------------------------------
 
-AUTHORITY_BASE = "https://login.microsoftonline.com"
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+DEFAULT_AUTHORITY_BASE = "https://login.microsoftonline.com"
+DEFAULT_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+AUTHORITY_BASE = os.environ.get("INGEST_OUTLOOK_AUTHORITY_BASE", DEFAULT_AUTHORITY_BASE).rstrip("/")
+GRAPH_BASE = os.environ.get("INGEST_OUTLOOK_GRAPH_BASE", DEFAULT_GRAPH_BASE).rstrip("/")
 
 DEFAULT_PERSONAL_SCOPES = [
     "User.Read",
@@ -86,7 +88,22 @@ DEFAULT_CORPORATE_SCOPES = [
     "offline_access",
 ]
 
-TOKEN_DIR = Path.home() / ".config" / "ingest-outlook"
+DEFAULT_READ_ONLY_SCOPES = [
+    "User.Read",
+    "Mail.Read",
+    "Calendars.Read",
+    "offline_access",
+]
+DEFAULT_OUTPUT_DIR = "External Inputs/Outlook"
+EXIT_READ_ONLY_BLOCKED = 3
+
+TOKEN_DIR = Path(
+    os.environ.get(
+        "INGEST_OUTLOOK_CONFIG_DIR",
+        str(Path.home() / ".config" / "ingest-outlook"),
+    )
+).expanduser()
+CONFIG_PATH = TOKEN_DIR / "config.json"
 TOKEN_PATH = TOKEN_DIR / "token.json"
 LOG_PATH = TOKEN_DIR / "log.jsonl"
 AUDIT_PATH = TOKEN_DIR / "audit.jsonl"
@@ -107,6 +124,45 @@ _run_started_at: float | None = None  # set in main()
 _active_cfg: "Config | None" = None   # set by get_access_token; used by mid-run 401 retry
 _verbose_mode = False                 # set by --verbose flag
 _quiet_mode = False                   # set by --quiet flag
+
+GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+TENANT_ALIASES = {"common", "organizations", "consumers"}
+WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def _configure_console_encoding() -> None:
+    """Keep Unicode diagnostics from crashing on legacy Windows code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def _chmod_private(path: Path, mode: int) -> None:
+    if os.name != "nt":
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def _ensure_config_dir() -> None:
+    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _chmod_private(TOKEN_DIR, 0o700)
+
+
+def _command_hint(command: str = "fix") -> str:
+    return f'"{sys.executable}" "{Path(__file__).resolve()}" {command}'
 
 
 def _verbose(msg: str) -> None:
@@ -129,11 +185,11 @@ AADSTS_HANDLERS: dict[str, tuple[str, str]] = {
     ),
     "AADSTS50173": (
         "Fresh authentication required (token too old, policy reset, or password changed).",
-        "Delete the token cache and re-authenticate: rm ~/.config/ingest-outlook/token.json && fetch.py doctor",
+        f"Delete the token cache at {TOKEN_PATH} and re-authenticate with: {_command_hint('fix')}",
     ),
     "AADSTS70008": (
         "Refresh token expired or revoked (90-day max for personal, tenant policy for corporate).",
-        "Delete the token cache and re-authenticate: rm ~/.config/ingest-outlook/token.json && fetch.py doctor",
+        f"Delete the token cache at {TOKEN_PATH} and re-authenticate with: {_command_hint('fix')}",
     ),
     "AADSTS65001": (
         "User or admin has not consented to one or more requested scopes.",
@@ -166,6 +222,14 @@ AADSTS_HANDLERS: dict[str, tuple[str, str]] = {
     "AADSTS500113": (
         "No reply address registered for the application.",
         "Verify the app's Authentication blade has http://localhost:8765/callback as a redirect URI for 'Mobile and desktop applications'.",
+    ),
+    "AADSTS50011": (
+        "The redirect URI does not match the app registration.",
+        "Configure http://localhost:8765/callback under the app's 'Mobile and desktop applications' platform.",
+    ),
+    "AADSTS7000218": (
+        "The app is not configured as a public client and Microsoft expected a client secret.",
+        "Set 'Allow public client flows' to Yes. This PKCE desktop app must not use a client secret.",
     ),
     "AADSTS9002313": (
         "Invalid request (malformed parameter).",
@@ -204,7 +268,7 @@ def _log_event(
     swallowed so logging never breaks the main operation.
     """
     try:
-        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_config_dir()
         event: dict[str, Any] = {
             "ts": _now_local_iso(),
             "command": command,
@@ -221,10 +285,7 @@ def _log_event(
             event.update(extra)
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        try:
-            os.chmod(LOG_PATH, 0o600)
-        except OSError:
-            pass
+        _chmod_private(LOG_PATH, 0o600)
     except OSError:
         pass
 
@@ -245,7 +306,7 @@ def _audit_action(
     log full body content to avoid PII expansion in plaintext).
     """
     try:
-        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_config_dir()
         event: dict[str, Any] = {
             "ts": _now_local_iso(),
             "action": action,
@@ -259,10 +320,7 @@ def _audit_action(
             event["error_code"] = error_code
         with AUDIT_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        try:
-            os.chmod(AUDIT_PATH, 0o600)
-        except OSError:
-            pass
+        _chmod_private(AUDIT_PATH, 0o600)
     except OSError:
         pass
 
@@ -276,15 +334,37 @@ def _body_sha8(body: str) -> str:
 
 
 class Config:
-    def __init__(self, client_id: str, tenant_id: str, scopes: list[str], redirect_port: int):
+    def __init__(
+        self,
+        client_id: str,
+        tenant_id: str,
+        scopes: list[str],
+        redirect_port: int,
+        read_only: bool = False,
+        teams: bool = False,
+        shared_calendars: bool = False,
+        output_dir: str = DEFAULT_OUTPUT_DIR,
+        vault_root: str | None = None,
+        graph_base: str = DEFAULT_GRAPH_BASE,
+        authority_base: str = DEFAULT_AUTHORITY_BASE,
+        sources: dict[str, str] | None = None,
+    ):
         self.client_id = client_id
         self.tenant_id = tenant_id
         self.scopes = scopes
         self.redirect_port = redirect_port
+        self.read_only = read_only
+        self.teams = teams
+        self.shared_calendars = shared_calendars
+        self.output_dir = output_dir
+        self.vault_root = vault_root
+        self.graph_base = graph_base.rstrip("/")
+        self.authority_base = authority_base.rstrip("/")
+        self.sources = sources or {}
 
     @property
     def authority(self) -> str:
-        return f"{AUTHORITY_BASE}/{self.tenant_id}"
+        return f"{self.authority_base}/{self.tenant_id}"
 
     @property
     def redirect_uri(self) -> str:
@@ -295,38 +375,167 @@ class Config:
         return self.tenant_id in ("common", "consumers")
 
 
-def load_config(client_id_arg: str | None = None) -> Config:
-    client_id = client_id_arg or os.environ.get("MS_GRAPH_CLIENT_ID")
-    tenant_id = os.environ.get("MS_GRAPH_TENANT_ID", "common")
-    port = int(os.environ.get("INGEST_OUTLOOK_REDIRECT_PORT", "8765"))
+def _read_config_file() -> dict[str, Any]:
+    if not CONFIG_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
+def validate_output_dir(value: str) -> str:
+    value = str(value).strip().replace("\\", "/")
+    posix_path = Path(value)
+    windows_path = PureWindowsPath(value)
+    if not value or posix_path.is_absolute() or windows_path.is_absolute():
+        raise ValueError("output_dir must be a non-empty path relative to the vault")
+    if any(part in {"", ".", ".."} for part in posix_path.parts):
+        raise ValueError("output_dir must not contain '.' or '..' components")
+    for part in posix_path.parts:
+        if re.search(r'[:*?"<>|]', part) or part.endswith((".", " ")):
+            raise ValueError(f"output_dir contains a Windows-unsafe component: {part!r}")
+        if part.lower() in WINDOWS_RESERVED_NAMES:
+            raise ValueError(f"output_dir contains a Windows reserved name: {part!r}")
+    return value.rstrip("/")
+
+
+def _value_with_source(
+    key: str,
+    arg_value: Any,
+    env_name: str | None,
+    file_config: dict[str, Any],
+    default: Any,
+) -> tuple[Any, str]:
+    if arg_value is not None:
+        return arg_value, "arg"
+    if env_name and env_name in os.environ:
+        return os.environ[env_name], "env"
+    if key in file_config and file_config[key] is not None:
+        return file_config[key], "file"
+    return default, "default"
+
+
+def _print_missing_client_id() -> None:
+    if os.name == "nt":
+        setup = f"  {_command_hint('configure')} --client-id <guid> --tenant-id <guid>"
+    else:
+        setup = (
+            f"  {_command_hint('configure')} --client-id <guid> --tenant-id <guid>\n"
+            "or export MS_GRAPH_CLIENT_ID in ~/.zshrc (or your shell profile)."
+        )
+    print(
+        "ERROR: Microsoft Graph client ID is not configured. / "
+        "El client ID de Microsoft Graph no está configurado.\n"
+        "Register an Entra app and configure its Application (client) ID.\n"
+        f"{setup}\n\nFor step-by-step recovery, run:\n  {_command_hint('fix')}",
+        file=sys.stderr,
+    )
+
+
+def load_config(
+    client_id_arg: str | None = None,
+    vault_root_arg: str | None = None,
+    overrides: dict[str, Any] | None = None,
+    require_client: bool = True,
+) -> Config:
+    """Load effective config with arg > env > config.json > default precedence."""
+    global GRAPH_BASE, AUTHORITY_BASE
+    file_config = _read_config_file()
+    args = dict(overrides or {})
+    if client_id_arg is not None:
+        args["client_id"] = client_id_arg
+    if vault_root_arg is not None:
+        args["vault_root"] = vault_root_arg
+
+    specs = {
+        "client_id": ("MS_GRAPH_CLIENT_ID", ""),
+        "tenant_id": ("MS_GRAPH_TENANT_ID", "common"),
+        "redirect_port": ("INGEST_OUTLOOK_REDIRECT_PORT", 8765),
+        "read_only": ("INGEST_OUTLOOK_READ_ONLY", False),
+        "output_dir": ("INGEST_OUTLOOK_OUTPUT_DIR", DEFAULT_OUTPUT_DIR),
+        "vault_root": ("INGEST_OUTLOOK_VAULT_ROOT", None),
+        "teams": (None, False),
+        "shared_calendars": (None, False),
+    }
+    values: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for key, (env_name, default) in specs.items():
+        values[key], sources[key] = _value_with_source(
+            key, args.get(key), env_name, file_config, default
+        )
+
+    client_id = str(values["client_id"] or "").strip()
+    tenant_id = str(values["tenant_id"] or "common").strip()
+    try:
+        port = int(values["redirect_port"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("INGEST_OUTLOOK_REDIRECT_PORT must be an integer") from exc
+    if not (1 <= port <= 65535):
+        raise ValueError("redirect_port must be between 1 and 65535")
+    read_only = _parse_bool(values["read_only"])
+    teams = _parse_bool(values["teams"])
+    shared_calendars = _parse_bool(values["shared_calendars"])
+    output_dir = validate_output_dir(str(values["output_dir"]))
+    vault_root = str(values["vault_root"]).strip() if values["vault_root"] else None
 
     scopes_env = os.environ.get("MS_GRAPH_SCOPES", "").strip()
     if scopes_env:
         scopes = scopes_env.split()
+        sources["scopes"] = "env"
+    elif read_only:
+        scopes = list(DEFAULT_READ_ONLY_SCOPES)
+        if shared_calendars:
+            scopes.append("Calendars.Read.Shared")
+        if teams:
+            scopes.extend(["OnlineMeetings.Read", "OnlineMeetingTranscript.Read.All"])
+        sources["scopes"] = "default(read-only profile)"
     elif tenant_id in ("common", "consumers"):
         scopes = list(DEFAULT_PERSONAL_SCOPES)
+        sources["scopes"] = "default(personal profile)"
     else:
         scopes = list(DEFAULT_CORPORATE_SCOPES)
+        sources["scopes"] = "default(corporate profile)"
 
-    if not client_id:
-        print(
-            "ERROR: MS_GRAPH_CLIENT_ID is not set. Register an Entra app at\n"
-            "  https://portal.azure.com (Microsoft Entra > App registrations)\n"
-            "and export MS_GRAPH_CLIENT_ID with the Application (client) ID.\n"
-            "See the ingest-outlook SKILL.md Prerequisites section for details.\n"
-            "\n"
-            "For step-by-step recovery, run:\n"
-            "  python ~/.claude/skills/ingest-outlook/fetch.py fix",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    if require_client and not client_id:
+        _print_missing_client_id()
+        raise SystemExit(2)
 
-    return Config(
+    graph_base = os.environ.get("INGEST_OUTLOOK_GRAPH_BASE", DEFAULT_GRAPH_BASE)
+    authority_base = os.environ.get("INGEST_OUTLOOK_AUTHORITY_BASE", DEFAULT_AUTHORITY_BASE)
+    sources["graph_base"] = "env" if "INGEST_OUTLOOK_GRAPH_BASE" in os.environ else "default"
+    sources["authority_base"] = "env" if "INGEST_OUTLOOK_AUTHORITY_BASE" in os.environ else "default"
+    cfg = Config(
         client_id=client_id,
         tenant_id=tenant_id,
         scopes=scopes,
         redirect_port=port,
+        read_only=read_only,
+        teams=teams,
+        shared_calendars=shared_calendars,
+        output_dir=output_dir,
+        vault_root=vault_root,
+        graph_base=graph_base,
+        authority_base=authority_base,
+        sources=sources,
     )
+    GRAPH_BASE = cfg.graph_base
+    AUTHORITY_BASE = cfg.authority_base
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +557,9 @@ def _save_token(token: dict[str, Any]) -> None:
     scope_str = token.get("scope", "")
     if scope_str:
         token["scopes_granted"] = scope_str.split()
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_config_dir()
     TOKEN_PATH.write_text(json.dumps(token, indent=2), encoding="utf-8")
-    try:
-        os.chmod(TOKEN_PATH, 0o600)
-    except OSError:
-        pass
+    _chmod_private(TOKEN_PATH, 0o600)
 
 
 def verify_scopes(token: dict[str, Any], required: list[str]) -> tuple[bool, list[str]]:
@@ -398,7 +604,7 @@ def _acquire_refresh_lock(timeout: int = LOCK_TIMEOUT) -> bool:
     acquired. Treats locks older than LOCK_STALE_AGE as orphans and steals
     them (a previous process likely crashed mid-refresh).
     """
-    TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_config_dir()
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -618,6 +824,8 @@ def get_access_token(config: Config, force_refresh: bool = False) -> str:
             try:
                 _verbose("refreshing token via refresh_token grant")
                 refreshed = _refresh_token(config, token["refresh_token"])
+                if not refreshed.get("refresh_token"):
+                    refreshed["refresh_token"] = token["refresh_token"]
                 _save_token(refreshed)
                 return refreshed["access_token"]
             except urllib.error.HTTPError:
@@ -997,6 +1205,21 @@ def fetch_calendar_events(
                      max_pages=max_pages, context="calendar fetch")
 
 
+def _normalize_graph_datetime(value: Any, timezone_name: Any) -> str:
+    """Make Graph's offset-less UTC timestamps unambiguous for ingestion."""
+    text = str(value or "")
+    zone = str(timezone_name or "").strip().lower()
+    if not text or zone not in {"", "utc"} or text.lower().endswith("z"):
+        return text
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        return text
+    return parsed.replace(microsecond=0).isoformat(timespec="seconds") + "Z"
+
+
 def calendar_events_to_payload(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for ev in raw:
@@ -1006,12 +1229,14 @@ def calendar_events_to_payload(raw: list[dict[str, Any]]) -> list[dict[str, Any]
             if body.get("contentType", "").lower() == "html"
             else body.get("content") or ev.get("bodyPreview") or ""
         )
+        start = ev.get("start") or {}
+        end = ev.get("end") or {}
         out.append({
             "id": ev.get("id") or "",
             "subject": ev.get("subject") or "",
-            "start": (ev.get("start") or {}).get("dateTime") or "",
-            "end": (ev.get("end") or {}).get("dateTime") or "",
-            "timezone": (ev.get("start") or {}).get("timeZone") or "",
+            "start": _normalize_graph_datetime(start.get("dateTime"), start.get("timeZone")),
+            "end": _normalize_graph_datetime(end.get("dateTime"), end.get("timeZone")),
+            "timezone": start.get("timeZone") or "",
             "organizer": _addr_to_str(ev.get("organizer")),
             "attendees": _addrs_to_list(ev.get("attendees")),
             "location": (ev.get("location") or {}).get("displayName") or "",
@@ -1108,13 +1333,15 @@ def meetings_to_payload(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if body.get("contentType", "").lower() == "html"
             else body.get("content") or ev.get("bodyPreview") or ""
         )
+        start = ev.get("start") or {}
+        end = ev.get("end") or {}
         out.append({
             "id": ev.get("id") or "",
             "meeting_id": entry.get("meeting_id") or "",
             "subject": ev.get("subject") or "",
-            "start": (ev.get("start") or {}).get("dateTime") or "",
-            "end": (ev.get("end") or {}).get("dateTime") or "",
-            "timezone": (ev.get("start") or {}).get("timeZone") or "",
+            "start": _normalize_graph_datetime(start.get("dateTime"), start.get("timeZone")),
+            "end": _normalize_graph_datetime(end.get("dateTime"), end.get("timeZone")),
+            "timezone": start.get("timeZone") or "",
             "organizer": _addr_to_str(ev.get("organizer")),
             "attendees": _addrs_to_list(ev.get("attendees")),
             "online_meeting_url": (ev.get("onlineMeeting") or {}).get("joinUrl") or "",
@@ -1248,14 +1475,109 @@ def _now_iso_local() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _validate_guid(value: str, label: str) -> str:
+    value = value.strip()
+    if not GUID_RE.fullmatch(value):
+        raise ValueError(f"{label} must be a GUID in 8-4-4-4-12 format")
+    return value
+
+
+def _validate_tenant_id(value: str) -> str:
+    value = value.strip()
+    if value in TENANT_ALIASES:
+        return value
+    return _validate_guid(value, "tenant-id")
+
+
+def _write_config_file(config: dict[str, Any]) -> None:
+    _ensure_config_dir()
+    CONFIG_PATH.write_text(
+        json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    _chmod_private(CONFIG_PATH, 0o600)
+
+
+def _show_effective_config(cfg: Config) -> None:
+    shown = {
+        "client_id": cfg.client_id,
+        "tenant_id": cfg.tenant_id,
+        "read_only": cfg.read_only,
+        "teams": cfg.teams,
+        "shared_calendars": cfg.shared_calendars,
+        "output_dir": cfg.output_dir,
+        "vault_root": cfg.vault_root,
+        "redirect_port": cfg.redirect_port,
+        "scopes": cfg.scopes,
+        "graph_base": cfg.graph_base,
+        "authority_base": cfg.authority_base,
+    }
+    print(f"Config file: {CONFIG_PATH}")
+    for key, value in shown.items():
+        source = cfg.sources.get(key, "env" if key in {"graph_base", "authority_base"} else "default")
+        rendered = json.dumps(value, ensure_ascii=False)
+        print(f"{key}: {rendered} (source: {source})")
+
+
+def cmd_configure(args: argparse.Namespace) -> int:
+    current = _read_config_file()
+    updates: dict[str, Any] = {}
+    if args.client_id is not None:
+        updates["client_id"] = _validate_guid(args.client_id, "client-id")
+    if args.tenant_id is not None:
+        updates["tenant_id"] = _validate_tenant_id(args.tenant_id)
+    for key in ("read_only", "teams", "shared_calendars"):
+        value = getattr(args, key)
+        if value is not None:
+            updates[key] = value
+    if args.output_dir is not None:
+        updates["output_dir"] = validate_output_dir(args.output_dir)
+    if args.vault_root is not None:
+        updates["vault_root"] = str(Path(args.vault_root).expanduser().resolve())
+
+    if updates:
+        current.update(updates)
+        _write_config_file(current)
+        print(f"Configuration saved to {CONFIG_PATH}")
+    elif not args.show:
+        print("No changes requested. Use --show to inspect effective configuration.")
+
+    if args.show:
+        cfg = load_config(overrides=updates, require_client=False)
+        _show_effective_config(cfg)
+    return 0
+
+
+def _vault_root_or_error(args: argparse.Namespace, cfg: Config) -> str:
+    vault_root = getattr(args, "vault_root", None) or cfg.vault_root
+    if not vault_root:
+        print(
+            "ERROR: vault root is required. Pass --vault-root or save it with "
+            f"`{_command_hint('configure')} --vault-root <path>`. ",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return vault_root
+
+
 def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--days", type=int, default=7, help="Lookback window in days.")
-    p.add_argument("--vault-root", required=True, help="Vault root path (passed through).")
+    p.add_argument("--vault-root", default=None, help="Vault root path; optional when configured.")
     p.add_argument(
         "--client-id",
         default=None,
         help="Override MS_GRAPH_CLIENT_ID env var.",
     )
+
+
+def _ahead_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer from 0 to 60") from exc
+    if not 0 <= days <= 60:
+        raise argparse.ArgumentTypeError("must be from 0 to 60")
+    return days
 
 
 def _add_auth_only_args(p: argparse.ArgumentParser) -> None:
@@ -1273,8 +1595,30 @@ def _split_csv(value: str | None) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _require_client(cfg: Config) -> None:
+    if not cfg.client_id:
+        _print_missing_client_id()
+        raise SystemExit(2)
+
+
+def _block_read_only(action: str, cfg: Config, summary: dict[str, Any]) -> int | None:
+    if not cfg.read_only:
+        return None
+    message = (
+        f"BLOCKED: {action} is disabled by the read-only profile. "
+        "No Microsoft data was changed. / "
+        f"BLOQUEADO: {action} está deshabilitado por el perfil de solo lectura. "
+        "No se modificaron datos de Microsoft."
+    )
+    print(message, file=sys.stderr)
+    _audit_action(action, "blocked_read_only", summary)
+    _log_event(action, "blocked_read_only")
+    return EXIT_READ_ONLY_BLOCKED
+
+
 def cmd_mail(args: argparse.Namespace) -> int:
-    cfg = load_config(args.client_id)
+    cfg = load_config(args.client_id, getattr(args, "vault_root", None))
+    vault_root = _vault_root_or_error(args, cfg)
     access_token = get_access_token(cfg)
 
     since = datetime.now(timezone.utc) - timedelta(days=args.days)
@@ -1299,7 +1643,8 @@ def cmd_mail(args: argparse.Namespace) -> int:
         "folder_or_query": args.scope,
         "scope_kind": args.scope_kind,
         "days": args.days,
-        "vault_root": args.vault_root,
+        "vault_root": vault_root,
+        "output_dir": cfg.output_dir,
         "ingested_at_iso": _now_iso_local(),
         "messages": mail_messages_to_payload(raw),
     }
@@ -1309,13 +1654,17 @@ def cmd_mail(args: argparse.Namespace) -> int:
 
 
 def cmd_calendar(args: argparse.Namespace) -> int:
-    cfg = load_config(args.client_id)
+    cfg = load_config(args.client_id, getattr(args, "vault_root", None))
+    vault_root = _vault_root_or_error(args, cfg)
     access_token = get_access_token(cfg)
 
-    start = datetime.now(timezone.utc) - timedelta(days=args.days)
-    end = datetime.now(timezone.utc)
-    start_iso = _iso_z(start)
-    end_iso = _iso_z(end)
+    today = datetime.now().astimezone().date()
+    start_date = today - timedelta(days=args.days - 1)
+    end_date = today + timedelta(days=args.ahead)
+    start_local = datetime.combine(start_date, datetime_time.min).astimezone()
+    end_local = datetime.combine(end_date, datetime_time(23, 59, 59)).astimezone()
+    start_iso = _iso_z(start_local.astimezone(timezone.utc))
+    end_iso = _iso_z(end_local.astimezone(timezone.utc))
 
     raw = fetch_calendar_events(
         start_iso, end_iso, access_token,
@@ -1325,9 +1674,11 @@ def cmd_calendar(args: argparse.Namespace) -> int:
     payload = {
         "kind": "calendar",
         "days": args.days,
-        "vault_root": args.vault_root,
+        "ahead": args.ahead,
+        "vault_root": vault_root,
+        "output_dir": cfg.output_dir,
         "ingested_at_iso": _now_iso_local(),
-        "date_range": [start_iso[:10], end_iso[:10]],
+        "date_range": [start_date.isoformat(), end_date.isoformat()],
         "calendar_id": getattr(args, "calendar_id", None) or "default",
         "events": calendar_events_to_payload(raw),
     }
@@ -1356,6 +1707,10 @@ def cmd_list_calendars(args: argparse.Namespace) -> int:
 
 
 def cmd_send_mail(args: argparse.Namespace) -> int:
+    cfg = load_config(args.client_id, require_client=False)
+    blocked = _block_read_only("send-mail", cfg, {"subject": args.subject})
+    if blocked is not None:
+        return blocked
     body_text = args.body
     if args.body_file:
         body_text = Path(args.body_file).read_text(encoding="utf-8")
@@ -1393,7 +1748,7 @@ def cmd_send_mail(args: argparse.Namespace) -> int:
         _audit_action("send-mail", "dry_run", audit_summary)
         return 0
 
-    cfg = load_config(args.client_id)
+    _require_client(cfg)
     access_token = get_access_token(cfg)
 
     try:
@@ -1413,6 +1768,10 @@ def cmd_send_mail(args: argparse.Namespace) -> int:
 
 
 def cmd_event_create(args: argparse.Namespace) -> int:
+    cfg = load_config(args.client_id, require_client=False)
+    blocked = _block_read_only("event-create", cfg, {"subject": args.subject})
+    if blocked is not None:
+        return blocked
     body_text = args.body or ""
     if args.body_file:
         body_text = Path(args.body_file).read_text(encoding="utf-8")
@@ -1445,7 +1804,7 @@ def cmd_event_create(args: argparse.Namespace) -> int:
         _audit_action("event-create", "dry_run", audit_summary)
         return 0
 
-    cfg = load_config(args.client_id)
+    _require_client(cfg)
     access_token = get_access_token(cfg)
 
     try:
@@ -1470,6 +1829,10 @@ def cmd_event_create(args: argparse.Namespace) -> int:
 
 
 def cmd_event_update(args: argparse.Namespace) -> int:
+    cfg = load_config(args.client_id, require_client=False)
+    blocked = _block_read_only("event-update", cfg, {"event_id": args.event_id})
+    if blocked is not None:
+        return blocked
     body_text = args.body
     if args.body_file:
         body_text = Path(args.body_file).read_text(encoding="utf-8")
@@ -1523,7 +1886,7 @@ def cmd_event_update(args: argparse.Namespace) -> int:
         _audit_action("event-update", "dry_run", audit_summary)
         return 0
 
-    cfg = load_config(args.client_id)
+    _require_client(cfg)
     access_token = get_access_token(cfg)
 
     try:
@@ -1550,6 +1913,10 @@ def cmd_event_update(args: argparse.Namespace) -> int:
 
 def cmd_event_delete(args: argparse.Namespace) -> int:
     audit_summary = {"event_id": args.event_id}
+    cfg = load_config(args.client_id, require_client=False)
+    blocked = _block_read_only("event-delete", cfg, audit_summary)
+    if blocked is not None:
+        return blocked
 
     if args.dry_run:
         print(f"DRY RUN, event {args.event_id} NOT deleted.")
@@ -1564,7 +1931,7 @@ def cmd_event_delete(args: argparse.Namespace) -> int:
         )
         return 2
 
-    cfg = load_config(args.client_id)
+    _require_client(cfg)
     access_token = get_access_token(cfg)
     try:
         delete_event(args.event_id, access_token)
@@ -1577,7 +1944,8 @@ def cmd_event_delete(args: argparse.Namespace) -> int:
 
 
 def cmd_meetings(args: argparse.Namespace) -> int:
-    cfg = load_config(args.client_id)
+    cfg = load_config(args.client_id, getattr(args, "vault_root", None))
+    vault_root = _vault_root_or_error(args, cfg)
     if cfg.is_personal_tenant:
         print(
             "WARNING: meetings subcommand requires Teams, which is not available on\n"
@@ -1597,7 +1965,8 @@ def cmd_meetings(args: argparse.Namespace) -> int:
     payload = {
         "kind": "meetings",
         "days": args.days,
-        "vault_root": args.vault_root,
+        "vault_root": vault_root,
+        "output_dir": cfg.output_dir,
         "ingested_at_iso": _now_iso_local(),
         "date_range": [start_iso[:10], end_iso[:10]],
         "meetings": meetings_to_payload(raw),
@@ -1637,13 +2006,15 @@ class CheckResult:
 
 def _fix_create_config_dir() -> tuple[bool, str]:
     try:
-        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_config_dir()
         return True, f"Created {TOKEN_DIR}"
     except OSError as e:
         return False, f"Cannot create {TOKEN_DIR}: {e}"
 
 
 def _fix_chmod_token() -> tuple[bool, str]:
+    if os.name == "nt":
+        return True, "Windows uses the user profile ACL; chmod is not applicable."
     try:
         os.chmod(TOKEN_PATH, 0o600)
         return True, f"Set {TOKEN_PATH} to mode 0o600"
@@ -1697,23 +2068,27 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
     PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
     results: list[CheckResult] = []
 
-    # 1. ENV
-    client_id = client_id_arg or os.environ.get("MS_GRAPH_CLIENT_ID")
-    tenant_id = os.environ.get("MS_GRAPH_TENANT_ID", "common")
+    cfg = load_config(client_id_arg, vault_root, require_client=False)
+    client_id = cfg.client_id
+    vault_root = vault_root or cfg.vault_root
+
+    # 1. CONFIG
     if not client_id:
         results.append(CheckResult(
-            FAIL, "env",
-            "MS_GRAPH_CLIENT_ID not set. (This cannot be auto-fixed; env vars must be set in your shell.)",
+            FAIL, "config",
+            "Microsoft Graph client ID is not configured.",
             fix_manual=[
                 "Get the Application (client) ID from your Azure app registration.",
-                "Then in your terminal, run:",
-                '  echo \'export MS_GRAPH_CLIENT_ID="<your-client-id>"\' >> ~/.zshrc',
-                "  source ~/.zshrc",
-                "After running it, re-run: python fetch.py fix",
+                f"Run: {_command_hint('configure')} --client-id <guid> --tenant-id <guid>",
+                "On macOS/Linux you may instead export MS_GRAPH_CLIENT_ID in ~/.zshrc.",
+                f"Then re-run: {_command_hint('fix')}",
             ],
         ))
     else:
-        results.append(CheckResult(PASS, "env", f"MS_GRAPH_CLIENT_ID set, tenant={tenant_id}"))
+        source = cfg.sources.get("client_id", "unknown")
+        results.append(CheckResult(
+            PASS, "config", f"client ID loaded from {source}, tenant={cfg.tenant_id}"
+        ))
 
     # 2. CONFIG DIR
     if not TOKEN_DIR.is_dir():
@@ -1750,33 +2125,38 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
 
     # 4. TOKEN FILE PERMISSIONS
     if TOKEN_PATH.is_file():
-        mode = oct(TOKEN_PATH.stat().st_mode & 0o777)
-        if mode == "0o600":
-            results.append(CheckResult(PASS, "token-perms", f"mode {mode} (owner-read-write only)"))
-        else:
+        if os.name == "nt":
             results.append(CheckResult(
-                FAIL, "token-perms",
-                f"Token file is mode {mode}; expected 0o600 (anyone on this machine could read your refresh token).",
-                fix_auto=_fix_chmod_token,
+                PASS, "token-perms", "Windows: protegido por el ACL del perfil de usuario"
             ))
+        else:
+            mode = oct(TOKEN_PATH.stat().st_mode & 0o777)
+            if mode == "0o600":
+                results.append(CheckResult(PASS, "token-perms", f"mode {mode} (owner-read-write only)"))
+            else:
+                results.append(CheckResult(
+                    FAIL, "token-perms",
+                    f"Token file is mode {mode}; expected 0o600 (anyone on this machine could read your refresh token).",
+                    fix_auto=_fix_chmod_token,
+                ))
 
     # 5. NETWORK
     try:
-        net_req = urllib.request.Request("https://graph.microsoft.com/v1.0/$metadata")
+        net_req = urllib.request.Request(f"{cfg.graph_base}/$metadata")
         t0 = time.time()
         with urllib.request.urlopen(net_req, timeout=10) as resp:
             _ = resp.read(1)
         latency = int((time.time() - t0) * 1000)
-        results.append(CheckResult(PASS, "network", f"graph.microsoft.com reachable ({latency}ms)"))
+        results.append(CheckResult(PASS, "network", f"Graph endpoint reachable ({latency}ms)"))
     except Exception as e:
         results.append(CheckResult(
             FAIL, "network",
-            f"Cannot reach graph.microsoft.com: {e}",
+            f"Cannot reach Graph endpoint: {e}",
             fix_manual=[
                 "Check your internet connection.",
                 "If you're on a corporate network, verify a proxy or firewall is not blocking *.microsoft.com.",
                 "Try: ping graph.microsoft.com",
-                "After connection is restored, re-run: python fetch.py fix",
+                f"After connection is restored, re-run: {_command_hint('fix')}",
             ],
         ))
 
@@ -1785,9 +2165,8 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
     network_ok = any(r.name == "network" and r.status == PASS for r in results)
     if client_id and token and token.get("refresh_token") and network_ok:
         try:
-            cfg = load_config(client_id)
             access_token = get_access_token(cfg)
-            me = _graph_get_json(f"{GRAPH_BASE}/me", access_token)
+            me = _graph_get_json(f"{cfg.graph_base}/me", access_token)
             who = me.get("userPrincipalName") or me.get("mail") or me.get("displayName") or "(unknown)"
             results.append(CheckResult(PASS, "auth", f"token validates as {who}"))
         except urllib.error.HTTPError as e:
@@ -1807,10 +2186,7 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
 
     # 7. SCOPES
     if token and access_token is not None:
-        if tenant_id in ("common", "consumers"):
-            expected = DEFAULT_PERSONAL_SCOPES
-        else:
-            expected = DEFAULT_CORPORATE_SCOPES
+        expected = cfg.scopes
         ok, missing = verify_scopes(token, expected)
         if not token.get("scopes_granted"):
             results.append(CheckResult(
@@ -1859,7 +2235,7 @@ def run_checks(vault_root: str | None = None, client_id_arg: str | None = None) 
 
     # 9. LOG / AUDIT files writable
     try:
-        TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        _ensure_config_dir()
         log_ok = audit_ok = True
         try:
             with LOG_PATH.open("a", encoding="utf-8"):
@@ -1905,7 +2281,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     results = run_checks(getattr(args, "vault_root", None))
     passed, warned, failed = _print_check_results(results)
     if failed > 0:
-        print(f"\nTo auto-repair, run: python {Path(__file__).name} fix")
+        print(f"\nTo auto-repair, run: {_command_hint('fix')}")
     _log_event("doctor", "success" if failed == 0 else "failure", extra={"passed": passed, "warned": warned, "failed": failed})
     return 0 if failed == 0 else 1
 
@@ -1999,7 +2375,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         if quiet:
             # Quiet mode: surface a single line so the hook can show it
             print(
-                f"ingest-outlook fix: {failed2} issue(s) need attention ({', '.join(manual_names)}). Run: python {Path(__file__).resolve()} fix",
+                f"ingest-outlook fix: {failed2} issue(s) need attention ({', '.join(manual_names)}). Run: {_command_hint('fix')}",
                 file=sys.stderr,
             )
         _log_event("fix", "partial", extra={"auto_fixed": auto_fixed, "auto_failed": auto_failed, "manual_required": manual_required, "remaining": failed2, "quiet": quiet})
@@ -2008,6 +2384,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
 
 def main() -> int:
     global _run_started_at
+    _configure_console_encoding()
     _run_started_at = time.time()
 
     parser = argparse.ArgumentParser(
@@ -2030,6 +2407,26 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    p_config = subparsers.add_parser(
+        "configure",
+        help="Write config.json or show the effective configuration and value sources.",
+    )
+    p_config.add_argument("--client-id", default=None, help="Application (client) GUID.")
+    p_config.add_argument("--tenant-id", default=None, help="Tenant GUID or common/organizations/consumers.")
+    ro_group = p_config.add_mutually_exclusive_group()
+    ro_group.add_argument("--read-only", dest="read_only", action="store_true", default=None)
+    ro_group.add_argument("--read-write", dest="read_only", action="store_false")
+    teams_group = p_config.add_mutually_exclusive_group()
+    teams_group.add_argument("--teams", dest="teams", action="store_true", default=None)
+    teams_group.add_argument("--no-teams", dest="teams", action="store_false")
+    shared_group = p_config.add_mutually_exclusive_group()
+    shared_group.add_argument("--shared-calendars", dest="shared_calendars", action="store_true", default=None)
+    shared_group.add_argument("--no-shared-calendars", dest="shared_calendars", action="store_false")
+    p_config.add_argument("--output-dir", default=None, help="Relative output directory inside the vault.")
+    p_config.add_argument("--vault-root", default=None, help="Default vault root path.")
+    p_config.add_argument("--show", action="store_true", help="Print effective values and their sources.")
+    p_config.set_defaults(func=cmd_configure)
+
     p_mail = subparsers.add_parser("mail", help="Fetch Outlook messages.")
     p_mail.add_argument("--scope", required=True, help="Folder name or search query.")
     p_mail.add_argument(
@@ -2046,6 +2443,12 @@ def main() -> int:
         "--calendar-id",
         default=None,
         help="Optional: read events from a specific calendar (use list-calendars to get IDs). Defaults to your default calendar.",
+    )
+    p_cal.add_argument(
+        "--ahead",
+        type=_ahead_days,
+        default=0,
+        help="Include this many future local calendar days (0-60; default: 0).",
     )
     _add_common_args(p_cal)
     p_cal.set_defaults(func=cmd_calendar)
@@ -2122,7 +2525,7 @@ def main() -> int:
     # --- Diagnostic: doctor (read-only) ---
     p_doc = subparsers.add_parser(
         "doctor",
-        help="Read-only diagnostic checks (env, token, network, scopes, vault, log files). Does NOT attempt fixes.",
+        help="Read-only diagnostic checks (config, token, network, scopes, vault, log files). Does NOT attempt fixes.",
     )
     p_doc.add_argument(
         "--vault-root",
@@ -2160,7 +2563,7 @@ def main() -> int:
     # quiet is also set per-subcommand (fix has its own --quiet); honor both
     _quiet_mode = bool(getattr(args, "quiet", False))
 
-    sos = "\nFor step-by-step recovery, run:\n  python ~/.claude/skills/ingest-outlook/fetch.py fix"
+    sos = f"\nFor step-by-step recovery, run:\n  {_command_hint('fix')}"
 
     try:
         result = args.func(args)
@@ -2176,6 +2579,11 @@ def main() -> int:
         _log_event(command_name, "failure", duration_ms=duration_ms, error_code="config_missing")
         # SOS already printed by load_config in this path
         raise
+    except ValueError as e:
+        duration_ms = int((time.time() - _run_started_at) * 1000) if _run_started_at else None
+        _log_event(command_name, "failure", duration_ms=duration_ms, error_code="invalid_config")
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     except Exception as e:
         duration_ms = int((time.time() - _run_started_at) * 1000) if _run_started_at else None
         _log_event(command_name, "failure", duration_ms=duration_ms, error_code=type(e).__name__)

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit and integration tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Windows installer smoke test
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $vault = Join-Path $env:RUNNER_TEMP "ingest-outlook-vault"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+            -VaultRoot $vault `
+            -ClientId "11111111-1111-4111-8111-111111111111" `
+            -TenantId "22222222-2222-4222-8222-222222222222" `
+            -ReadOnly
+          $fetch = Join-Path $vault ".claude\skills\ingest-outlook\fetch.py"
+          py -3 $fetch configure --show
+          $env:INGEST_OUTLOOK_GRAPH_BASE = "http://127.0.0.1:9"
+          py -3 $fetch doctor
+          if ($LASTEXITCODE -notin @(0, 1)) {
+            throw "doctor crashed with exit code $LASTEXITCODE"
+          }
